@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MCH Monthly Consolidation</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="masthead-mark" aria-hidden="true">MCH</div>
+    <div class="masthead-text">
+      <h1>MCH Monthly Consolidation</h1>
+      <p>Nursing Chart Review Checklist &mdash; Madinah Health Cluster</p>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- STEP 1: UPLOAD -->
+    <section class="panel" id="panel-upload">
+      <div class="panel-head">
+        <h2>1. Add this month's unit reports</h2>
+        <p class="panel-sub">Each file is one unit/ward's checklist for the month. Columns will be combined in the order files are added below.</p>
+      </div>
+
+      <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Upload Excel files">
+        <div class="dropzone-inner">
+          <p class="dropzone-title">Drag &amp; drop Excel files here</p>
+          <p class="dropzone-sub">or</p>
+          <button type="button" class="btn btn-primary" id="btn-choose">Choose Excel files</button>
+          <input type="file" id="file-input" accept=".xlsx" multiple hidden>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 2: FILE LIST -->
+    <section class="panel" id="panel-files" hidden>
+      <div class="panel-head">
+        <h2>2. Review order &amp; status</h2>
+        <p class="panel-sub">This is the exact column order the final report will use. Move a row to change its position.</p>
+      </div>
+
+      <table class="file-table" id="file-table">
+        <thead>
+          <tr>
+            <th class="col-order">Order</th>
+            <th class="col-name">File</th>
+            <th class="col-unit">Unit / Ward</th>
+            <th class="col-count">Patients</th>
+            <th class="col-status">Status</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody id="file-table-body"></tbody>
+      </table>
+
+      <div class="add-more">
+        <button type="button" class="btn btn-ghost" id="btn-add-more">+ Add more files</button>
+      </div>
+    </section>
+
+    <!-- STEP 3: GENERATE -->
+    <section class="panel" id="panel-generate" hidden>
+      <div class="filename-field">
+        <label for="output-filename">Output file name</label>
+        <div class="filename-input-row">
+          <input type="text" id="output-filename" placeholder="CHART_MCH_Consolidated" maxlength="150" autocomplete="off">
+          <span class="filename-ext">.xlsx</span>
+        </div>
+        <p class="filename-hint">Optional — leave blank to use the default name. Characters <code>\ / : * ? " &lt; &gt; |</code> aren't allowed and will be stripped.</p>
+      </div>
+
+      <div class="generate-row">
+        <div>
+          <p class="generate-summary" id="generate-summary"></p>
+        </div>
+        <button type="button" class="btn btn-primary btn-large" id="btn-generate" disabled>Generate Final Report</button>
+      </div>
+
+      <div class="progress" id="progress" hidden>
+        <ol class="progress-steps" id="progress-steps">
+          <li data-step="reading">Reading files</li>
+          <li data-step="validating">Validating structure</li>
+          <li data-step="extracting">Extracting patient data</li>
+          <li data-step="consolidating">Consolidating columns</li>
+          <li data-step="scoring">Calculating scores</li>
+          <li data-step="summary">Building Summary</li>
+          <li data-step="finalizing">Generating Excel file</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- STEP 4: RESULT -->
+    <section class="panel panel-result" id="panel-result" hidden>
+      <div class="result-head">
+        <h2 id="result-title">Report generated successfully</h2>
+        <p id="result-sub"></p>
+      </div>
+      <div id="result-details"></div>
+      <a class="btn btn-primary btn-large" id="btn-download" href="#" download>Download Final Excel Report</a>
+    </section>
+
+    <!-- ERROR BANNER -->
+    <div class="error-banner" id="error-banner" hidden>
+      <p id="error-message"></p>
+    </div>
+
+  </main>
+
+  <footer>
+    <p>Runs locally &mdash; files never leave this machine.</p>
+    <p class="credit">Developed by Wejdan Boharam</p>
+  </footer>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
