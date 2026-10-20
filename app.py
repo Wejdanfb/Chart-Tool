@@ -15,8 +15,13 @@ import os
 import re
 import json
 import uuid
-import fcntl
 import contextlib
+import threading
+
+try:
+    import fcntl  # POSIX (Render/Linux): cross-process file lock
+except ImportError:  # Windows: the local tool runs as a single process, a thread lock is enough
+    fcntl = None
 import shutil
 import logging
 from pathlib import Path
@@ -59,6 +64,9 @@ def _valid_batch_id(batch_id) -> bool:
     return bool(batch_id) and bool(_BATCH_ID_RE.match(str(batch_id)))
 
 
+_THREAD_LOCK = threading.RLock()
+
+
 class _BatchStore:
     def _dir(self, batch_id):
         if not _valid_batch_id(batch_id):
@@ -85,12 +93,16 @@ class _BatchStore:
         """Cross-process lock so two simultaneous requests can't overwrite each other."""
         d = self._dir(batch_id)
         d.mkdir(parents=True, exist_ok=True)
-        with open(d / ".lock", "w") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            try:
+        with _THREAD_LOCK:
+            if fcntl is None:
                 yield
-            finally:
-                fcntl.flock(fh, fcntl.LOCK_UN)
+                return
+            with open(d / ".lock", "w") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 BATCHES = _BatchStore()
