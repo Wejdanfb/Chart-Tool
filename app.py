@@ -13,7 +13,10 @@ review / download interface.
 
 import os
 import re
+import json
 import uuid
+import fcntl
+import contextlib
 import shutil
 import logging
 from pathlib import Path
@@ -43,15 +46,73 @@ INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-# In-memory session store: batch_id -> ordered list of file records.
-# Fine for a single-user local tool; not meant for concurrent multi-user use.
-BATCHES = {}
+# Batch state (batch_id -> ordered list of file records) is kept on disk, one small JSON
+# file per batch, instead of in a Python dict. Under gunicorn there can be several worker
+# processes, each with its own memory; an in-memory dict meant a file uploaded through one
+# worker was invisible to the next request handled by another worker, so uploaded files
+# never showed up in the list. The filesystem is shared by all workers, so it is the
+# single source of truth. Same interface as before: BATCHES.get(...) / BATCHES[id] = ...
+_BATCH_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def _valid_batch_id(batch_id) -> bool:
+    return bool(batch_id) and bool(_BATCH_ID_RE.match(str(batch_id)))
+
+
+class _BatchStore:
+    def _dir(self, batch_id):
+        if not _valid_batch_id(batch_id):
+            raise ValueError("Invalid batch id.")
+        return UPLOAD_DIR / batch_id
+
+    def get(self, batch_id, default=None):
+        if not _valid_batch_id(batch_id):
+            return default
+        try:
+            return json.loads((self._dir(batch_id) / "batch.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return default
+
+    def __setitem__(self, batch_id, records):
+        d = self._dir(batch_id)
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f"batch.json.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(records), encoding="utf-8")
+        os.replace(tmp, d / "batch.json")  # atomic
+
+    @contextlib.contextmanager
+    def lock(self, batch_id):
+        """Cross-process lock so two simultaneous requests can't overwrite each other."""
+        d = self._dir(batch_id)
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / ".lock", "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+BATCHES = _BatchStore()
+
 
 # internal output filename (on disk in OUTPUT_DIR, never seen by the user) -> the
-# download filename the user actually asked for. Entirely separate from the
-# consolidation engine: consolidate() always writes to its own internally-chosen path
-# and knows nothing about what the user wants the downloaded copy called.
-DOWNLOAD_NAMES = {}
+# download filename the user actually asked for. Stored as a small sidecar file next to
+# the output so every worker process sees it. Entirely separate from the consolidation
+# engine: consolidate() always writes to its own internally-chosen path and knows
+# nothing about what the user wants the downloaded copy called.
+class _DownloadNames:
+    def __setitem__(self, internal_name, download_name):
+        (OUTPUT_DIR / f"{internal_name}.name").write_text(download_name, encoding="utf-8")
+
+    def get(self, internal_name, default=None):
+        try:
+            return (OUTPUT_DIR / f"{internal_name}.name").read_text(encoding="utf-8") or default
+        except OSError:
+            return default
+
+
+DOWNLOAD_NAMES = _DownloadNames()
 
 
 def _safe_name(filename: str) -> str:
@@ -85,17 +146,17 @@ def upload():
     across multiple calls (e.g. if the user adds a few more files later) - this is
     what determines patient-column order in the final report."""
     batch_id = request.form.get("batch_id") or str(uuid.uuid4())
+    if not _valid_batch_id(batch_id):
+        return jsonify({"error": "Invalid batch id."}), 400
     batch_dir = UPLOAD_DIR / batch_id
     batch_dir.mkdir(parents=True, exist_ok=True)
-
-    if batch_id not in BATCHES:
-        BATCHES[batch_id] = []
 
     files = request.files.getlist("files")
     if not files:
         return jsonify({"error": "No files received."}), 400
 
     results = []
+    new_records = []
     for f in files:
         original_name = f.filename or "file.xlsx"
         ext = os.path.splitext(original_name)[1].lower()
@@ -122,10 +183,16 @@ def upload():
             "unit_name": info.unit_name,
             "patient_count": info.patient_count,
         }
-        BATCHES[batch_id].append(record)
+        new_records.append(record)
         results.append({k: v for k, v in record.items() if k != "path"})
 
-    return jsonify({"batch_id": batch_id, "results": results, "order": [r["file_id"] for r in BATCHES[batch_id]]})
+    # Append to whatever is already stored for this batch (another request/worker may
+    # have added files meanwhile), under a lock.
+    with BATCHES.lock(batch_id):
+        BATCHES[batch_id] = (BATCHES.get(batch_id) or []) + new_records
+        order = [r["file_id"] for r in BATCHES.get(batch_id)]
+
+    return jsonify({"batch_id": batch_id, "results": results, "order": order})
 
 
 @app.route("/api/batch/<batch_id>", methods=["GET"])
@@ -139,18 +206,25 @@ def get_batch(batch_id):
 
 @app.route("/api/batch/<batch_id>/remove/<file_id>", methods=["POST"])
 def remove_file(batch_id, file_id):
-    records = BATCHES.get(batch_id, [])
-    BATCHES[batch_id] = [r for r in records if r["file_id"] != file_id]
-    return jsonify({"files": [{k: v for k, v in r.items() if k != "path"} for r in BATCHES[batch_id]]})
+    if not _valid_batch_id(batch_id):
+        return jsonify({"files": []})
+    with BATCHES.lock(batch_id):
+        records = BATCHES.get(batch_id, [])
+        BATCHES[batch_id] = [r for r in records if r["file_id"] != file_id]
+        remaining = BATCHES.get(batch_id)
+    return jsonify({"files": [{k: v for k, v in r.items() if k != "path"} for r in remaining]})
 
 
 @app.route("/api/batch/<batch_id>/reorder", methods=["POST"])
 def reorder(batch_id):
     """Accepts {"order": [file_id, file_id, ...]} and reorders the batch to match -
     used if the user drags files to rearrange them before generating."""
+    if not _valid_batch_id(batch_id):
+        return jsonify({"ok": False}), 400
     order = request.json.get("order", [])
-    records = {r["file_id"]: r for r in BATCHES.get(batch_id, [])}
-    BATCHES[batch_id] = [records[fid] for fid in order if fid in records]
+    with BATCHES.lock(batch_id):
+        records = {r["file_id"]: r for r in BATCHES.get(batch_id, [])}
+        BATCHES[batch_id] = [records[fid] for fid in order if fid in records]
     return jsonify({"ok": True})
 
 
@@ -158,6 +232,8 @@ def reorder(batch_id):
 def generate():
     batch_id = request.json.get("batch_id")
     custom_filename = request.json.get("filename", "")
+    if not _valid_batch_id(batch_id):
+        return jsonify({"error": "No files in this batch."}), 400
     records = BATCHES.get(batch_id, [])
     if not records:
         return jsonify({"error": "No files in this batch."}), 400
@@ -217,6 +293,8 @@ def generate():
 
 @app.route("/api/download/<name>", methods=["GET"])
 def download(name):
+    if name != os.path.basename(name) or not name.endswith(".xlsx"):
+        return jsonify({"error": "File not found."}), 404
     path = OUTPUT_DIR / name
     if not path.exists():
         return jsonify({"error": "File not found."}), 404
@@ -226,4 +304,4 @@ def download(name):
 
 if __name__ == "__main__":
     print("MCH Consolidation Tool running at http://localhost:5050")
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 5050)), debug=False)

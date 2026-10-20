@@ -44,6 +44,19 @@
     el.errorBanner.hidden = true;
   }
 
+  // Parse a fetch Response as JSON without throwing; a proxy/timeout/size error page
+  // (HTML, empty body) becomes a readable message instead of a silent failure.
+  async function readJson(resp) {
+    try {
+      return await resp.json();
+    } catch (e) {
+      return { error: `The server returned an unexpected response (HTTP ${resp.status}). ` +
+                      (resp.status === 413 ? "The files are too large to upload. " : "") +
+                      (resp.status === 502 || resp.status === 503 || resp.status === 504
+                        ? "The server may be starting up or timed out - please wait a moment and try again." : "") };
+    }
+  }
+
   // ---------- Upload ----------
 
   async function uploadFiles(fileList) {
@@ -58,11 +71,11 @@
     try {
       resp = await fetch("/api/upload", { method: "POST", body: formData });
     } catch (e) {
-      showError("Could not reach the local server. Is app.py still running?");
+      showError("Could not reach the server. Please check your connection and try again.");
       return;
     }
 
-    const data = await resp.json();
+    const data = await readJson(resp);
     if (!resp.ok) {
       showError(data.error || "Upload failed.");
       return;
@@ -75,8 +88,18 @@
 
   async function refreshBatch() {
     if (!state.batchId) return;
-    const resp = await fetch(`/api/batch/${state.batchId}`);
-    const data = await resp.json();
+    let resp;
+    try {
+      resp = await fetch(`/api/batch/${state.batchId}`);
+    } catch (e) {
+      showError("Could not reach the server. Please check your connection and try again.");
+      return;
+    }
+    const data = await readJson(resp);
+    if (!resp.ok || !data.files) {
+      showError(data.error || "Could not load the uploaded files.");
+      return;
+    }
     state.files = data.files;
     render();
   }
@@ -279,12 +302,12 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ batch_id: state.batchId, filename: el.outputFilename.value }),
       });
-      data = await resp.json();
+      data = await readJson(resp);
     } catch (e) {
       cancelled = true;
       el.progress.hidden = true;
       el.btnGenerate.disabled = false;
-      showError("Could not reach the local server. Is app.py still running?");
+      showError("Could not reach the server. Please check your connection and try again.");
       return;
     }
 
