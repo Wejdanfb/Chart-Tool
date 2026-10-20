@@ -3,6 +3,7 @@
 
   const state = {
     batchId: null,
+    epoch: 0, // bumped by "start new report"; in-flight uploads/generations from before it are dropped
     files: [], // {file_id, filename, valid, error, warnings, unit_name, patient_count}
   };
 
@@ -63,6 +64,7 @@
     if (!fileList || fileList.length === 0) return;
     clearError();
 
+    const epoch = state.epoch;
     const formData = new FormData();
     if (state.batchId) formData.append("batch_id", state.batchId);
     for (const f of fileList) formData.append("files", f);
@@ -71,11 +73,12 @@
     try {
       resp = await fetch("/api/upload", { method: "POST", body: formData });
     } catch (e) {
-      showError("Could not reach the server. Please check your connection and try again.");
+      if (epoch === state.epoch) showError("Could not reach the server. Please check your connection and try again.");
       return;
     }
 
     const data = await readJson(resp);
+    if (epoch !== state.epoch) return; // the user started a new report while this was uploading
     if (!resp.ok) {
       showError(data.error || "Upload failed.");
       return;
@@ -382,6 +385,7 @@
       if (!cancelled) setStep(STEP_IDS.length - 1, STEP_IDS.length - 1);
     })();
 
+    const epoch = state.epoch;
     let resp, data;
     try {
       resp = await fetch("/api/generate", {
@@ -392,6 +396,7 @@
       data = await readJson(resp);
     } catch (e) {
       cancelled = true;
+      if (epoch !== state.epoch) return;
       el.progress.hidden = true;
       el.btnGenerate.disabled = false;
       showError("Could not reach the server. Please check your connection and try again.");
@@ -399,6 +404,7 @@
     }
 
     await stepThrough;
+    if (epoch !== state.epoch) return; // a new report was started while this one was generating
 
     if (!resp.ok) {
       el.progress.hidden = true;
@@ -447,6 +453,52 @@
     // for anyone who wants to review it (see app.py's logging around consolidate()).
 
     el.panelResult.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  // ---------- Home: title link -> back to the start (upload) screen ----------
+  //
+  // The title is a real link to "/", so it works from every screen (upload, review,
+  // generating, result, error). If nothing has been added yet it just returns to the start
+  // screen. If there ARE files or a generated report on screen, nothing is cleared until the
+  // user explicitly confirms "Start new report" - an accidental click never loses their work.
+
+  const homeDialog = document.getElementById("home-dialog");
+  const homeLinks = [document.getElementById("home-link"), document.getElementById("logo-link")];
+
+  function hasWorkOnScreen() {
+    return state.files.length > 0 || !el.panelResult.hidden || !el.progress.hidden;
+  }
+
+  function resetToHome() {
+    state.epoch += 1;
+    state.batchId = null;
+    state.files = [];
+    el.outputFilename.value = "";
+    el.progress.hidden = true;
+    el.panelResult.hidden = true;
+    el.resultDetails.innerHTML = "";
+    el.btnDownload.removeAttribute("href");
+    el.progressSteps.querySelectorAll("li").forEach(li => li.classList.remove("done", "active"));
+    clearError();
+    el.fileInput.value = "";
+    render(); // shows the upload panel, hides review/generate, disables Generate
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  homeLinks.forEach(link => link.addEventListener("click", (e) => {
+    // let "open in new tab" gestures behave like a normal link
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    e.preventDefault();
+    if (!hasWorkOnScreen()) { resetToHome(); return; }
+    if (homeDialog && typeof homeDialog.showModal === "function") {
+      homeDialog.showModal();
+    } else if (window.confirm("Start a new report? The files you added and any generated report will be cleared.")) {
+      resetToHome();
+    }
+  }));
+  if (homeDialog) {
+    document.getElementById("home-cancel").addEventListener("click", () => homeDialog.close());
+    document.getElementById("home-confirm").addEventListener("click", () => { homeDialog.close(); resetToHome(); });
   }
 
   render();

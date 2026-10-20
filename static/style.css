@@ -1,5 +1,5 @@
 /* ============================================================
-   MCH Monthly Consolidation — visual identity
+   MCH Monthly Report — visual identity
 
    Grounded in the source material itself: the checklist's own
    banner uses a deep teal mark on a warm cream/gold field. That
@@ -68,6 +68,25 @@ html, body {
   margin-bottom: 36px;
 }
 
+/* Logo slot: the supplied image (aspect ratio preserved) with the original "MCH" mark as
+   a fallback if the image can't be loaded. */
+.masthead-logo {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+}
+.masthead-logo-img {
+  display: block;
+  height: 56px;
+  width: auto;
+  max-width: 180px;
+  object-fit: contain;
+}
+.masthead-logo .masthead-mark { display: none; }
+.masthead-logo.logo-failed .masthead-logo-img { display: none; }
+.masthead-logo.logo-failed .masthead-mark { display: flex; }
+
 .masthead-mark {
   flex: 0 0 auto;
   width: 52px;
@@ -89,6 +108,14 @@ html, body {
   font-weight: 700;
   color: var(--teal-900);
 }
+
+.home-link {
+  color: inherit;
+  text-decoration: none;
+  border-radius: 4px;
+}
+.home-link:hover { color: var(--teal-600); }
+.home-link:focus-visible { outline: 2px solid var(--teal-600); outline-offset: 3px; }
 
 .masthead-text p {
   margin: 4px 0 0;
@@ -112,6 +139,8 @@ html, body {
   font-weight: 700;
   color: var(--teal-900);
 }
+
+.panel-head-plain h2 { margin-bottom: 18px; }
 
 .panel-sub {
   margin: 0 0 20px;
@@ -559,15 +588,31 @@ footer {
   color: var(--ink-faint);
   font-size: 12.5px;
   margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
 }
+
+/* Home-link confirmation dialog */
+.home-dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px 26px;
+  max-width: 400px;
+  color: var(--ink);
+  box-shadow: 0 12px 36px rgba(15, 61, 64, 0.22);
+}
+.home-dialog::backdrop { background: rgba(28, 35, 33, 0.35); }
+.home-dialog h2 { margin: 0 0 8px; font-size: 17px; color: var(--teal-900); }
+.home-dialog p { margin: 0 0 20px; font-size: 14px; color: var(--ink-soft); }
+.home-dialog-actions { display: flex; gap: 10px; justify-content: flex-end; }
 
 footer p { margin: 0 0 4px; }
 footer p:last-child { margin-bottom: 0; }
 
 footer .credit {
-  font-size: 11.5px;
+  font-size: 12px;
+  letter-spacing: 0.01em;
   color: var(--ink-faint);
-  opacity: 0.75;
 }
 
 @media (max-width: 640px) {

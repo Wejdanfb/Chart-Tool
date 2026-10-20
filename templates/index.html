@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MCH Monthly Consolidation</title>
+<title>MCH Monthly Report</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,10 +11,16 @@
 <div class="page">
 
   <header class="masthead">
-    <div class="masthead-mark" aria-hidden="true">MCH</div>
+    <!-- Logo: /static/logo.png. If the image is missing or fails to load, the onerror handler
+         adds .logo-failed and the original "MCH" mark is shown instead. -->
+    <a class="masthead-logo" href="/" id="logo-link" tabindex="-1" aria-hidden="true">
+      <img src="/static/logo.png" alt="" class="masthead-logo-img"
+           onerror="this.parentNode.classList.add('logo-failed')">
+      <span class="masthead-mark">MCH</span>
+    </a>
     <div class="masthead-text">
-      <h1>MCH Monthly Consolidation</h1>
-      <p>Nursing Chart Review Checklist &mdash; Madinah Health Cluster</p>
+      <h1><a class="home-link" id="home-link" href="/" title="Back to the start screen">MCH Monthly Report</a></h1>
+      <p>Chart Review collecting tool</p>
     </div>
   </header>
 
@@ -22,9 +28,8 @@
 
     <!-- STEP 1: UPLOAD -->
     <section class="panel" id="panel-upload">
-      <div class="panel-head">
-        <h2>1. Add this month's unit reports</h2>
-        <p class="panel-sub">Each file is one unit/ward's checklist for the month. Columns will be combined in the order files are added below.</p>
+      <div class="panel-head panel-head-plain">
+        <h2>1. Add unit chart review</h2>
       </div>
 
       <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Upload Excel files">
@@ -112,9 +117,18 @@
   </main>
 
   <footer>
-    <p>Runs locally &mdash; files never leave this machine.</p>
-    <p class="credit">Developed by Wejdan Boharam</p>
+    <p class="credit">&copy; 2026 Wejdan Boharam. All Rights Reserved.</p>
   </footer>
+
+  <!-- Confirmation shown only when the home link is used while files/results are on screen -->
+  <dialog id="home-dialog" class="home-dialog" aria-labelledby="home-dialog-title">
+    <h2 id="home-dialog-title">Start a new report?</h2>
+    <p>The files you added and any generated report will be cleared from this screen.</p>
+    <div class="home-dialog-actions">
+      <button type="button" class="btn btn-ghost" id="home-cancel">Keep working</button>
+      <button type="button" class="btn btn-primary" id="home-confirm">Start new report</button>
+    </div>
+  </dialog>
 
 </div>
 
