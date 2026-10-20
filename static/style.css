@@ -287,6 +287,51 @@ html, body {
 .status-badge.error { background: var(--error-bg); color: var(--error); }
 .status-badge.warn { background: var(--gold-100); color: #8a6d1f; }
 
+/* Status labels that carry an explanation: same pill as before, but a button so it can be
+   focused / tapped, plus a small "i" marker. The explanation itself is a floating tooltip
+   (see .status-tooltip) instead of permanent text under the label. */
+button.status-badge.has-tip {
+  border: 0;
+  font-family: inherit;
+  cursor: help;
+  line-height: inherit;
+}
+button.status-badge.has-tip:focus-visible {
+  outline: 2px solid var(--teal-600);
+  outline-offset: 2px;
+}
+.tip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  font-size: 9px;
+  font-weight: 800;
+  font-style: italic;
+  font-family: Georgia, "Times New Roman", serif;
+  line-height: 1;
+}
+
+.status-tooltip {
+  position: absolute;
+  z-index: 1000;
+  max-width: min(360px, calc(100vw - 16px));
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--teal-900);
+  color: #fff;
+  font-size: 12.5px;
+  line-height: 1.45;
+  font-weight: 400;
+  white-space: pre-line;
+  box-shadow: 0 6px 18px rgba(15, 61, 64, 0.25);
+  pointer-events: none;
+}
+.status-tooltip[hidden] { display: none; }
+
 .status-detail {
   display: block;
   margin-top: 4px;

@@ -4,16 +4,30 @@ Consolidates each month's unit-level Nursing Chart Review Checklist files
 (Madinah Health Cluster) into one formatted `.xlsx` report, with a live
 Summary sheet — replacing the manual copy/paste process.
 
-## Running it locally
+## Running it locally (Windows)
 
-You need Python 3.9+ installed. Then, from this folder:
+**One-time setup:** install Python 3.9 or newer from
+https://www.python.org/downloads/ — on the first installer screen, tick
+**"Add python.exe to PATH"**.
+
+**Every time you want to use the tool:**
+
+1. Extract the ZIP to a folder (e.g. `C:\MCH-Tool`). If you are replacing an
+   older copy, extract over it or into a new folder — the `uploads\` and
+   `outputs\` folders hold nothing you need to keep.
+2. Double-click **`Start_MCH_Tool.bat`**. The first run installs the required
+   packages (needs internet once); then your browser opens the tool.
+
+Prefer the command line? From the extracted folder:
 
 ```
-pip install -r requirements.txt
-python app.py
+py -m pip install -r requirements.txt
+py app.py
 ```
 
-Open **http://localhost:5050** in your browser. Leave the terminal window
+(On macOS/Linux use `pip install -r requirements.txt` and `python app.py`.)
+
+Open **http://localhost:5050** in your browser if it didn't open itself. Leave the terminal window
 open while you use it — closing it stops the tool. To stop on purpose,
 press `Ctrl+C` in that terminal.
 
@@ -24,11 +38,14 @@ process running on your own machine, and all files stay in this folder's
 ## How to use it each month
 
 1. Drag in (or choose) all of this month's unit report files.
-2. Check the review table — each row shows the detected unit, patient
-   count, and status. Anything that isn't recognized is flagged with why,
-   and blocks report generation until removed or replaced. A file with
-   multiple Unit/Ward values, or an unusual merged cell, shows up as a
-   warning underneath its status — not blocking, just worth a glance.
+2. Check the **Review** table — each row shows the detected unit, patient
+   count, and a short status: **Ready**, **Review** (worth a glance, not
+   blocking) or **Not recognized / Not compatible** (blocks report
+   generation until the file is removed or replaced). Rows that have an
+   explanation show a small **i** on the status label — hover over it (or
+   tap it on a touch screen) to read the details: multiple Unit/Ward
+   values, unusual merged cells, duplicate patients that were skipped,
+   or exactly why a file isn't recognized / compatible.
 3. The column order in the final report follows the order files appear
    in that table. Use the ↑/↓ buttons to rearrange, or × to remove one.
 4. Optionally type a name in **Output file name** — just the name, no
@@ -45,12 +62,32 @@ process running on your own machine, and all files stay in this folder's
   Put your cleanest file first if you notice a unit's copy has typos in
   the item text (the tool will warn you about this when it detects a
   mismatch, but won't block generation over it).
-- A file is recognized as valid **based only on its `Nursing Chart
-  Review Checklist` sheet and structure** — the right section headers,
-  the right patient-column layout, and a `Score` column. A unit file's
-  own `SUMMSRY` sheet, if it has one, is completely ignored: not
-  required, not read, not copied. Plenty of real monthly files don't
+- **Worksheets are recognized by their content, never by their name.**
+  Every worksheet in every uploaded workbook is inspected. One counts as
+  a checklist when it has section headers in column A (rows like
+  "A. INITIAL ASSESSMENT"), numbered checklist items under them, patient
+  columns starting at column L, and a column labeled `Score` in the
+  header row (row 9). It can be called anything — `Sheet1`, `ICU Jan`,
+  the original `Nursing Chart Review Checklist` — and sit anywhere in the
+  workbook. Blank sheets, cover pages, summary sheets and anything else
+  that doesn't look like a checklist are simply not processed. A
+  workbook's own `SUMMSRY` sheet, if it has one, is completely ignored:
+  not required, not read, not copied. Plenty of real monthly files don't
   have one at all, and that's fine.
+- **One workbook can hold several checklist sheets** (for example one
+  per department), and **one sheet can hold several units**. Every
+  recognized sheet contributes its patient columns — file by file, sheet
+  by sheet, in list order. The output always has a single consolidated
+  sheet named `Nursing Chart Review Checklist`, whatever the first
+  source sheet was called.
+- **No patient is counted twice.** If a workbook contains a duplicate
+  copy of a sheet — or the same data turns up in two uploaded files —
+  columns that are identical (same MRN, dates, unit and every response)
+  to ones already taken from an earlier sheet/file are skipped, and the
+  row's **i** tooltip says how many. The first occurrence in list order
+  is the one kept. A column with no identifying details at all (no MRN,
+  dates or unit) is never treated as a duplicate, since it can't be told
+  apart from a different patient.
 - Every file's patient columns are placed side by side, **in list
   order**, with each file's own "Score" column dropped.
 - **One new Score column is added at the very end** — its position is
@@ -75,9 +112,9 @@ process running on your own machine, and all files stay in this folder's
   files (P2CD, PICU): identical headers and item text at all 12
   sections, despite 1–3 average cells each having been individually
   damaged — both correctly recognized as the same 12-section template.
-- **Every other uploaded file must use the exact same checklist
-  structure as the master file** — same section headers, at the same
-  row positions. Since patient columns are placed by row position, a
+- **Every other checklist sheet must use the exact same checklist
+  structure as the master sheet** — same section headers, at the same
+  row positions, and the same item numbering. Since patient columns are placed by row position, a
   file whose own section headers sit at different rows (or say
   something different) than the master's is a genuinely different
   checklist template, and combining it would silently attach its
@@ -157,31 +194,35 @@ process running on your own machine, and all files stay in this folder's
 
 A successful run shows a clean confirmation in the browser: total
 patients, the Score column, units included, the file name, and the
-download button — nothing else. All the underlying checks (unusual
-merges, checklist wording differences, multiple Unit/Ward values,
-excluded empty columns, dropdown verification) still run on every
-single file, every time — they just report to the terminal window
-running `python app.py`, not the browser, so a normal month ends with
-a simple "done" screen instead of a wall of internal detail. Worth
-checking that terminal if a report ever looks off.
+download button — nothing else. On the **Review** screen, a file's
+notes (multiple Unit/Ward values, unusual merges, skipped duplicates,
+damaged source averages, excluded empty columns) are available only as
+a hover/tap tooltip on its status label. All the underlying checks
+still run on every single file, every time, and the full detail —
+including which worksheets were not treated as checklists, and the
+dropdown verification — is also written to the terminal window running
+the tool. Worth checking that window if a report ever looks off.
 
 ## Files
 
 - `app.py` — local web server (Flask): serves the page, handles
   upload/validate/reorder/generate/download, the output-filename
   sanitizing, and logs the diagnostic detail mentioned above.
+- `Start_MCH_Tool.bat` — Windows double-click launcher.
 - `consolidate.py` — all the actual Excel logic (openpyxl). This is
   where to look if a future month's template changes and something
   needs adjusting.
 - `templates/`, `static/` — the browser UI.
 - `uploads/`, `outputs/` — working folders, created automatically.
 
-## If something gets flagged as "not recognized"
+## If something gets flagged
 
-The tool checks that a file has a sheet named exactly `Nursing Chart
-Review Checklist`, that row 14 reads `A. INITIAL ASSESSMENT`, and that
-it can find a column literally labeled `Score` in row 9. That's the
-entire recognition rule — a missing `SUMMSRY` sheet is never a reason
-for rejection. If a unit's file structure has drifted from the
-checklist requirements above, you'll see the specific reason in the
-status column rather than a silently wrong report.
+**Not recognized** means no worksheet in the file looks like a checklist
+(the tooltip lists every worksheet and why it was skipped — typically a
+missing `Score` header in row 9, no "A. ..." section headers, or no
+numbered items). **Not compatible** means a checklist worksheet was
+found but its structure differs from the master (the first file in the
+list): the tooltip names the sheet and spells out which section headers,
+rows or item numbers differ. Either remove that file, or put a file that
+matches the others first. A missing `SUMMSRY` sheet, or a different
+worksheet name, is never a reason for rejection.

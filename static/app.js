@@ -84,6 +84,13 @@
     state.batchId = data.batch_id;
     // Merge: server returns the running order of file_ids; refetch full batch to stay in sync.
     await refreshBatch();
+
+    // Anything the server refused outright (e.g. not an .xlsx) never enters the list, so
+    // say so instead of letting it silently vanish.
+    const rejected = (data.results || []).filter(r => !r.file_id);
+    if (rejected.length > 0) {
+      showError(rejected.map(r => `${r.filename}: ${r.error || "not accepted"}`).join(" "));
+    }
   }
 
   async function refreshBatch() {
@@ -106,17 +113,93 @@
 
   // ---------- File table rendering ----------
 
+  // Short status label only; the explanation lives in a tooltip (hover / keyboard focus on
+  // a desktop, tap on a touch screen) so the list stays compact with 15-17 files. Blocking
+  // errors keep their red "Not recognized" / "Not compatible" label and still carry the full
+  // explanation - they are just no longer printed under every row.
   function statusBadge(f) {
+    let cls, label, tip;
     if (!f.valid) {
-      return `<span class="status-badge error">Not recognized</span>
-              <span class="status-detail">${escapeHtml(f.error || "")}</span>`;
+      cls = "error";
+      label = f.error_kind === "incompatible" ? "Not compatible" : "Not recognized";
+      tip = f.error || "";
+    } else if (f.warnings && f.warnings.length > 0) {
+      cls = "warn";
+      label = "Review";
+      tip = f.warnings.join("\n\n");
+    } else {
+      cls = "ok";
+      label = "Ready";
+      tip = "";
     }
-    if (f.warnings && f.warnings.length > 0) {
-      return `<span class="status-badge warn">Ready &middot; check note</span>
-              <span class="status-detail">${escapeHtml(f.warnings.join(" "))}</span>`;
-    }
-    return `<span class="status-badge ok">Ready</span>`;
+    if (!tip) return `<span class="status-badge ${cls}">${label}</span>`;
+    return `<button type="button" class="status-badge has-tip ${cls}" data-tip="${escapeHtml(tip)}"
+              aria-label="${label}. Show details">${label}<span class="tip-icon" aria-hidden="true">i</span></button>`;
   }
+
+  // ---------- Status tooltip (hover, keyboard focus, tap) ----------
+
+  const tipEl = document.createElement("div");
+  tipEl.className = "status-tooltip";
+  tipEl.setAttribute("role", "tooltip");
+  tipEl.id = "status-tooltip";
+  tipEl.hidden = true;
+  document.body.appendChild(tipEl);
+  let tipOwner = null;
+  let tipPinned = false; // opened by tap/click: stays until tapped elsewhere
+
+  function showTip(target) {
+    tipEl.textContent = target.dataset.tip;
+    tipEl.hidden = false;
+    tipOwner = target;
+    target.setAttribute("aria-describedby", "status-tooltip");
+    const r = target.getBoundingClientRect();
+    const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+    let left = r.left + r.width / 2 - tw / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+    let top = r.bottom + 8;
+    if (top + th > window.innerHeight - 8 && r.top - th - 8 > 8) top = r.top - th - 8;
+    tipEl.style.left = `${left + window.scrollX}px`;
+    tipEl.style.top = `${top + window.scrollY}px`;
+  }
+
+  function hideTip() {
+    tipEl.hidden = true;
+    if (tipOwner) tipOwner.removeAttribute("aria-describedby");
+    tipOwner = null;
+    tipPinned = false;
+  }
+
+  const hoverCapable = window.matchMedia && window.matchMedia("(hover: hover)").matches;
+  if (hoverCapable) {
+    el.tableBody.addEventListener("mouseover", (e) => {
+      const t = e.target.closest(".has-tip");
+      if (t && !tipPinned) showTip(t);
+    });
+    el.tableBody.addEventListener("mouseout", (e) => {
+      const t = e.target.closest(".has-tip");
+      if (t && !tipPinned && !t.contains(e.relatedTarget)) hideTip();
+    });
+  }
+  el.tableBody.addEventListener("focusin", (e) => {
+    const t = e.target.closest(".has-tip");
+    if (t && !tipPinned) showTip(t);
+  });
+  el.tableBody.addEventListener("focusout", () => { if (!tipPinned) hideTip(); });
+  document.addEventListener("click", (e) => {
+    const t = e.target.closest && e.target.closest(".has-tip");
+    if (t) {
+      // tap/click toggles a pinned tooltip (this is how touch devices open it)
+      if (tipOwner === t && tipPinned) { hideTip(); return; }
+      showTip(t);
+      tipPinned = true;
+      return;
+    }
+    if (!tipEl.hidden) hideTip();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideTip(); });
+  window.addEventListener("scroll", () => { if (!tipEl.hidden && tipOwner) showTip(tipOwner); }, { passive: true });
+  window.addEventListener("resize", () => { if (!tipEl.hidden && tipOwner) showTip(tipOwner); });
 
   function render() {
     const hasFiles = state.files.length > 0;
@@ -124,6 +207,7 @@
     el.panelFiles.hidden = !hasFiles;
     el.panelGenerate.hidden = !hasFiles;
 
+    hideTip();
     el.tableBody.innerHTML = state.files.map((f, i) => `
       <tr data-file-id="${f.file_id}">
         <td class="col-order"><span class="order-badge">${i + 1}</span></td>
@@ -217,6 +301,9 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ order: arr.map(f => f.file_id) }),
     });
+    // Compatibility with the master (first file) and duplicate-patient handling depend on
+    // the order, so re-read the statuses after a move.
+    await refreshBatch();
   }
 
   // ---------- Upload interactions ----------
@@ -334,7 +421,7 @@
     const fileRows = report.files.map(f => `
       <tr>
         <td>${escapeHtml(f.filename)}</td>
-        <td>${escapeHtml(f.unit || "&mdash;")}</td>
+        <td>${escapeHtml(f.unit || "\u2014")}</td>
         <td>${f.patient_count}</td>
         <td>${escapeHtml(f.columns)}</td>
       </tr>
@@ -345,7 +432,7 @@
         <dt>File name</dt><dd>${escapeHtml(report.download_filename || "")}</dd>
         <dt>Total patients</dt><dd>${report.total_patients}</dd>
         <dt>Score column</dt><dd>${escapeHtml(report.score_column)}</dd>
-        <dt>Units included</dt><dd>${report.files.length}</dd>
+        <dt>Units included</dt><dd>${report.files.filter(f => f.patient_count > 0).length}</dd>
       </dl>
       <table class="file-table" style="margin-top:14px;">
         <thead><tr><th>File</th><th>Unit</th><th>Patients</th><th>Columns</th></tr></thead>

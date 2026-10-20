@@ -4,19 +4,35 @@ MCH Nursing Chart Review Checklist - monthly consolidation engine.
 Everything here was reverse-engineered directly from real source files and a
 real final example (never hand-designed), per the rules below:
 
-- Every uploaded file is one unit/ward's monthly report. It has a sheet named
-  'Nursing Chart Review Checklist' with:
+- Every uploaded workbook holds one or more Nursing Chart Review Checklist
+  worksheets. A worksheet is recognized by its CONTENT - never by its name,
+  position, the file name, or the presence of a SUMMSRY sheet: it must have a
+  "Score" column header (row 9 in the standard layout) to the right of the
+  master columns, section headers in column A ("A. INITIAL ASSESSMENT" ...),
+  numbered checklist items under them, and patient columns:
     * columns A:K = fixed master structure (item numbers, descriptions,
-      section headers) - identical across all files
+      section headers) - identical across compatible sheets
     * columns L onward = one column per patient reviewed that month
     * immediately after the last patient column, one column literally
       labeled "Score" in row 9, holding per-item formulas
       =((SUM(<patient range>))/(COUNT(<patient range>)*2))
       and per-section AVERAGE formulas at "average rows"
+  Blank sheets, cover pages, summary sheets and anything else that doesn't look
+  like a checklist are simply not processed. Every recognized worksheet of every
+  file contributes its patient columns (file by file, sheet by sheet, in upload
+  order). A single sheet may also mix several units/wards.
 
-- The FIRST uploaded file's A:K structure, row heights, legend, and overall
-  formatting become the master template for the output (no separate blank
-  master file exists - confirmed identical structure across real files).
+- Duplicate protection: each kept patient column gets an identity fingerprint
+  (MRN/dates/unit rows + every response). A column identical to one already taken
+  from a DIFFERENT sheet or file is skipped, so a workbook that holds duplicate
+  copies of the same data never counts a patient twice. Columns with no
+  identifying metadata at all are never treated as duplicates.
+
+- The FIRST recognized checklist sheet of the FIRST uploaded file supplies the A:K
+  structure, row heights, legend, and overall formatting - the master template
+  for the output (no separate blank master file exists). The output sheet is
+  always named 'Nursing Chart Review Checklist', whatever the source sheet was
+  called.
 
 - Consolidation = concatenate every file's patient columns in upload order
   (dropping each file's own Score column), then add ONE new Score column
@@ -42,20 +58,20 @@ real final example (never hand-designed), per the rules below:
   columns A and B are BOTH blank (the conventional average-row position,
   regardless of what - if anything - actually occupies it).
 
-- Every OTHER uploaded file's own section headers (row positions AND
-  header text) are compared against the base file's before consolidating.
-  If they don't match, that file uses a genuinely different checklist
-  template and is rejected with a specific explanation (which headers
-  differ) rather than silently misaligning its patient columns to the
+- Every OTHER recognized sheet's section headers (row positions AND header
+  text) and numbered items are compared against the master's before
+  consolidating. If they don't match, that sheet uses a genuinely different
+  checklist template and is rejected with a specific explanation (which headers
+  or items differ) rather than silently misaligning its patient columns to the
   wrong checklist items. A damaged/missing average formula never enters
   into this comparison - only the actual section structure does.
 
 - SUMMSRY: a source workbook's own 'SUMMSRY' sheet, if it has one, is
   *completely irrelevant* to this tool. It is never read, never required,
   and never copied, and it never determines how many sections are expected.
-  Recognizing a file as a valid source depends only on its 'Nursing Chart
-  Review Checklist' sheet and structure - some real monthly files don't
-  have a SUMMSRY sheet at all, and that's fine.
+  Recognizing a file as a valid source depends only on its checklist
+  worksheet(s) - some real monthly files don't have a SUMMSRY sheet at all,
+  and that's fine.
 
       SOURCE FILES (checklist + patient data)
             |
@@ -75,8 +91,10 @@ real final example (never hand-designed), per the rules below:
 """
 
 import copy
+import datetime
+import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 import openpyxl
@@ -84,10 +102,13 @@ from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
-SHEET_CHECKLIST = "Nursing Chart Review Checklist"
+SHEET_CHECKLIST = "Nursing Chart Review Checklist"  # canonical name given to the OUTPUT sheet -
+                                                     # source sheets may be named anything
 SHEET_SUMMARY = "SUMMSRY"
-PATIENT_START_COL = 12  # column L
-HEADER_ROW = 9  # row with sequential patient index numbers + "Score" label
+PATIENT_START_COL = 12  # column L - first patient column (columns A:K are the fixed master structure)
+HEADER_SEARCH_ROWS = 40  # a sheet's "Score" header is looked for in its first N rows
+SCORE_SEARCH_COLS = 200  # ...and in up to this many columns right of column L
+MIN_ITEM_ROWS = 3  # a sheet needs at least this many numbered checklist items to count as a checklist
 STRUCTURE_SCAN_LIMIT = 2000  # generous safety ceiling when scanning for section headers
 TRAILING_ROW_PADDING = 12  # rows carried past the last section-average row (blank/
                            # signature rows below the last section) - not a structural
@@ -101,10 +122,35 @@ SUMMARY_FORMULA_COL = 4  # D
 # capital letter, a period, then the section name) in every real file seen so far -
 # never a formula or number. This is the actual evidence a section exists.
 _SECTION_HEADER_RE = re.compile(r"^[A-Z]\.")
+_ITEM_NUMBER_RE = re.compile(r"^\d+\.?$")
+_UNIT_LABEL_RE = re.compile(r"unit\s*/?\s*ward", re.IGNORECASE)
 
 
 class ValidationError(Exception):
     pass
+
+
+@dataclass
+class SheetAnalysis:
+    """One worksheet that was recognized, from its CONTENT alone, as a Nursing Chart
+    Review Checklist (never from its name, position, or a fixed cell)."""
+    name: str
+    header_row: int  # row holding the patient index numbers + the "Score" label
+    score_col: int  # 1-indexed column of this sheet's OWN "Score" column
+    section_headers: list  # row positions of this sheet's section headers
+    section_header_text: list  # normalized header text, same order
+    item_numbers: list  # [(row, item number text)] for every numbered item row
+    avg_rows: list  # section-average rows (derived from the headers, never from formulas)
+    kept_offsets: list  # 0-indexed offsets from column L that have real response data
+    excluded_empty_count: int = 0  # candidate columns dropped for having no data at all
+    unit_name: Optional[str] = None
+    column_keys: list = field(default_factory=list)  # per kept column: identity fingerprint
+                                                     # (or None when it can't be told apart)
+    warnings: list = field(default_factory=list)
+
+    @property
+    def patient_count(self):
+        return len(self.kept_offsets)
 
 
 @dataclass
@@ -115,20 +161,19 @@ class FileAnalysis:
     error: Optional[str] = None
     warnings: list = field(default_factory=list)
     unit_name: Optional[str] = None
-    patient_count: int = 0
-    score_col: Optional[int] = None  # 1-indexed column of this file's OWN "Score" column
-    avg_rows: list = field(default_factory=list)  # this file's OWN average-row positions
-                                                   # (derived from section headers, never
-                                                   # from formula presence - see below)
-    section_headers: list = field(default_factory=list)  # row positions of this file's
-                                                           # OWN section headers
-    section_header_text: list = field(default_factory=list)  # normalized header text,
-                                                               # same order as above -
-                                                               # the actual evidence used
-                                                               # to compare templates
-    kept_offsets: list = field(default_factory=list)  # 0-indexed offsets from column L
-                                                       # that have real response data
-    excluded_empty_count: int = 0  # candidate columns dropped for having no data at all
+    patient_count: int = 0  # across all recognized sheets (before cross-file duplicate removal)
+    sheets: list = field(default_factory=list)  # [SheetAnalysis] - every recognized checklist sheet
+    skipped_sheets: list = field(default_factory=list)  # [(sheet name, reason)] - internal only
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        d = dict(d)
+        d["sheets"] = [SheetAnalysis(**s) for s in d.get("sheets", [])]
+        d["skipped_sheets"] = [tuple(x) for x in d.get("skipped_sheets", [])]
+        return cls(**d)
 
 
 def _norm(v):
@@ -137,121 +182,109 @@ def _norm(v):
     return re.sub(r"\s+", " ", str(v)).strip()
 
 
-def analyze_file(path: str, filename: str) -> FileAnalysis:
-    """Validate structure and detect patient columns / unit name for one uploaded file."""
-    try:
-        wb = openpyxl.load_workbook(path, data_only=False)
-    except Exception as e:
-        return FileAnalysis(path, filename, valid=False, error=f"Could not open file: {e}")
+def _norm_value(v):
+    """Stable text form of a cell value for fingerprinting (dates, 2 vs 2.0, stray spaces)."""
+    if v is None:
+        return ""
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return v.isoformat()
+    if isinstance(v, float) and v == int(v):
+        return str(int(v))
+    return _norm(v)
 
-    if SHEET_CHECKLIST not in wb.sheetnames:
-        return FileAnalysis(
-            path, filename, valid=False,
-            error=f"Sheet '{SHEET_CHECKLIST}' not found. Sheets present: {wb.sheetnames}",
-        )
-    ws = wb[SHEET_CHECKLIST]
 
-    # Signature check: this is the anchor that confirms it's really this template.
-    if not _norm(ws["A14"].value).upper().startswith("A. INITIAL ASSESSMENT"):
-        return FileAnalysis(
-            path, filename, valid=False,
-            error="Row 14 does not read 'A. INITIAL ASSESSMENT' - this file doesn't "
-                  "match the expected Nursing Chart Review Checklist structure.",
-        )
+def _find_score_header(ws):
+    """Locate the sheet's own 'Score' column header: a cell that reads exactly 'Score' in
+    one of the first rows, to the right of the master columns. Returns (row, col) or None.
+    This - together with section headers and numbered items - is what identifies a
+    checklist sheet; the sheet's NAME is never consulted."""
+    last_row = min(ws.max_row, HEADER_SEARCH_ROWS)
+    last_col = min(ws.max_column, PATIENT_START_COL + SCORE_SEARCH_COLS)
+    for r in range(1, last_row + 1):
+        for c in range(PATIENT_START_COL, last_col + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str) and v.strip().lower() == "score":
+                return r, c
+    return None
 
-    # Find this file's own "Score" column, scanning row 9 rightward from column L.
-    score_col = None
-    for c in range(PATIENT_START_COL, PATIENT_START_COL + 200):
-        v = ws.cell(row=HEADER_ROW, column=c).value
-        if isinstance(v, str) and v.strip().lower() == "score":
-            score_col = c
-            break
-    if score_col is None:
-        return FileAnalysis(
-            path, filename, valid=False,
-            error="Could not find a 'Score' column header in row 9 - cannot determine "
-                  "where patient columns end.",
-        )
+
+def _unit_row(ws, header_row, first_header_row):
+    """Row holding each patient's Unit/Ward - found by its label in column A (between the
+    header row and the first section), falling back to header_row + 3 (row 12 in the
+    standard layout) if no label matches."""
+    for r in range(header_row + 1, first_header_row):
+        if _UNIT_LABEL_RE.search(_norm(ws.cell(row=r, column=1).value)):
+            return r
+    return header_row + 3
+
+
+def _analyze_sheet(ws):
+    """Decide from CONTENT whether `ws` is a Nursing Chart Review Checklist. Returns
+    (SheetAnalysis, None) if it is, or (None, reason) if not - blank sheets, cover pages,
+    summary sheets and anything else land in the second case."""
+    if ws.max_row < 5 or ws.max_column < PATIENT_START_COL:
+        return None, "too small to be a checklist"
+
+    found = _find_score_header(ws)
+    if found is None:
+        return None, "no 'Score' column header found"
+    header_row, score_col = found
 
     patient_count = score_col - PATIENT_START_COL
     if patient_count <= 0:
-        return FileAnalysis(
-            path, filename, valid=False,
-            error="No patient columns found between column L and the Score column.",
-        )
+        return None, "no patient columns between column L and the Score column"
 
-    # Detect this file's OWN section headers - the actual evidence its checklist
-    # structure exists, never whether a section-average formula happens to still
-    # work (real files regularly have that one cell overwritten by manual editing;
-    # the header text is far more durable evidence of what checklist this is). A
-    # file with 9 sections and a file with 12 are both fine on their own; whether
-    # they're the SAME template as each other is checked later, once the upload
-    # order (and so which file is the master) is known - see consolidate().
-    section_headers = _find_section_headers(ws)
+    # Dissolve merges in the patient/Score region IN MEMORY ONLY (nothing here is saved) so
+    # every cell read below - including patients whose cells were visually merged - holds
+    # its real value. See _sweep_merges_in_region.
+    _sweep_merges_in_region(ws, PATIENT_START_COL, score_col)
+
+    section_headers = _find_section_headers(ws, header_row)
     if not section_headers:
-        return FileAnalysis(
-            path, filename, valid=False,
-            error="No section headers found in this file's checklist (column A should "
-                  "have rows like 'A. INITIAL ASSESSMENT') - can't determine its "
-                  "checklist structure.",
-        )
+        return None, ("no section headers found (column A should have rows like "
+                      "'A. INITIAL ASSESSMENT')")
     boundaries = _compute_boundaries(ws, section_headers)
     avg_rows = [b[0] for b in boundaries]
     section_header_text = [_norm(ws.cell(row=h, column=1).value) for h in section_headers]
+    item_rows = _item_rows_for(ws, boundaries)
 
-    # Data-quality note only, never a structural one (see _section_has_working_average) -
-    # logged for anyone reviewing the source files, never blocks recognition.
-    damaged_sections = [
-        section_header_text[i] for i, avg_row in enumerate(avg_rows)
-        if not _section_has_working_average(ws, score_col, avg_row)
-    ]
-
-    # Note: a source file's own 'SUMMSRY' sheet (if it has one at all) is never checked,
-    # read, or required. Recognition depends only on the checklist sheet above. The final
-    # Summary is always generated fresh by this tool from the consolidated checklist - see
-    # module docstring.
+    item_numbers = []
+    for avg_row, start, end in boundaries:
+        for r in range(start, end + 1):
+            a = _norm(ws.cell(row=r, column=1).value)
+            if _ITEM_NUMBER_RE.match(a):
+                item_numbers.append((r, a.rstrip(".")))
+    if len(item_numbers) < MIN_ITEM_ROWS:
+        return None, "no numbered checklist items under the section headers"
 
     # A candidate patient column is only excluded if it has NO response data anywhere in
     # the actual checklist response area (the item rows - never based on the Unit/Ward
     # row, and never just because some individual cells are blank). Any real content at
     # all - a 0/1/2 score, "NA"/"N/A", any other text response - counts; formatting alone
     # never does, since only cell values are inspected here.
-    item_rows = _item_rows_for(ws, boundaries)
     kept_offsets, excluded_offsets = [], []
     for i in range(patient_count):
         col = PATIENT_START_COL + i
-        has_response = any(
-            ws.cell(row=r, column=col).value is not None
-            and str(ws.cell(row=r, column=col).value).strip() != ""
-            for r in item_rows
-        )
+        has_response = any(_norm(ws.cell(row=r, column=col).value) != "" for r in item_rows)
         (kept_offsets if has_response else excluded_offsets).append(i)
 
     if not kept_offsets:
-        return FileAnalysis(
-            path, filename, valid=False,
-            error=f"All {patient_count} candidate patient column(s) in this file are "
-                  f"empty - no response data found in the checklist area for any of them.",
-        )
+        return None, (f"all {patient_count} candidate patient column(s) are empty - no "
+                      f"response data found in the checklist area")
 
-    # Detect unit/ward name(s) (row 12), over the KEPT columns only - an excluded empty
-    # column's unit label (if any) doesn't end up in the output, so it shouldn't factor
-    # into what unit this file is reported as. Usually one value repeated across every
-    # patient column in a file, but a file can legitimately mix units (e.g. one
-    # department's combined monthly submission covering two wards) - that's fine and not
-    # an error; every kept patient column is still included regardless of its label.
-    unit_values = [
-        _norm(ws.cell(row=12, column=PATIENT_START_COL + i).value)
-        for i in kept_offsets
-    ]
+    # Unit/ward name(s), over the KEPT columns only. Usually one value repeated across the
+    # sheet, but a sheet can legitimately mix several units - that is fine and not an
+    # error: every kept patient column is still included regardless of its label.
+    unit_row = _unit_row(ws, header_row, section_headers[0])
+    unit_values = [_norm(ws.cell(row=unit_row, column=PATIENT_START_COL + i).value)
+                   for i in kept_offsets]
     unique_units = sorted(set(u for u in unit_values if u))
     warnings = []
     if len(unique_units) > 1:
         unit_name = " + ".join(unique_units)
         warnings.append(
-            f"Multiple different Unit/Ward values found within this file: {unique_units}. "
-            f"All {len(kept_offsets)} patient columns with response data are still "
-            f"included in the consolidated report."
+            f"Multiple different Unit/Ward values found: {unique_units}. All "
+            f"{len(kept_offsets)} patient columns with response data are still included."
         )
     else:
         unit_name = unique_units[0] if unique_units else None
@@ -263,43 +296,232 @@ def analyze_file(path: str, filename: str) -> FileAnalysis:
             f"as patients, no gap left in the numbering)."
         )
 
-    if damaged_sections:
+    # Data-quality note only, never a structural one (see _section_has_working_average).
+    damaged = [section_header_text[i] for i, avg_row in enumerate(avg_rows)
+               if not _section_has_working_average(ws, score_col, avg_row)]
+    if damaged:
         warnings.append(
-            f"{len(damaged_sections)} section(s) had a damaged/overwritten average "
-            f"formula in this source file ({', '.join(damaged_sections)}) - a "
-            f"data-quality issue in the source file only. The section itself is still "
-            f"fully recognized from its header and items, and its average in the final "
-            f"report is always calculated fresh, never copied from here."
+            f"{len(damaged)} section(s) had a damaged/overwritten average formula in this "
+            f"source ({', '.join(damaged)}) - a data-quality issue in the source only. The "
+            f"section is still fully recognized from its header and items, and its average "
+            f"in the final report is always calculated fresh, never copied from here."
         )
 
+    # Identity fingerprint per kept patient column: everything the reviewer entered about
+    # that patient (the metadata rows - MRN, dates, unit - plus every response). Used only
+    # to avoid counting the same patient twice when a workbook, or two uploaded files,
+    # contain copies of the same data. A column with NO metadata at all (no MRN/dates/unit)
+    # gets None: without any identifying detail, two identical-looking columns could be
+    # two different patients, so such a column is never treated as a duplicate.
+    meta_rows = range(header_row + 1, section_headers[0])
+    column_keys = []
+    for i in kept_offsets:
+        col = PATIENT_START_COL + i
+        meta = [_norm_value(ws.cell(row=r, column=col).value) for r in meta_rows]
+        if not any(meta):
+            column_keys.append(None)
+            continue
+        resp = [_norm_value(ws.cell(row=r, column=col).value) for r in item_rows]
+        column_keys.append(hashlib.sha1(repr((meta, resp)).encode("utf-8")).hexdigest())
+
+    return SheetAnalysis(
+        name=ws.title, header_row=header_row, score_col=score_col,
+        section_headers=section_headers, section_header_text=section_header_text,
+        item_numbers=item_numbers, avg_rows=avg_rows, kept_offsets=kept_offsets,
+        excluded_empty_count=len(excluded_offsets), unit_name=unit_name,
+        column_keys=column_keys, warnings=warnings,
+    ), None
+
+
+def analyze_file(path: str, filename: str) -> FileAnalysis:
+    """Inspect EVERY worksheet of an uploaded workbook and recognize the checklist
+    worksheet(s) by their content (section headers, numbered items, patient columns and a
+    Score column) - never by sheet name, sheet position, filename, or the presence of a
+    SUMMSRY sheet. A workbook may hold one checklist sheet or several (e.g. one per
+    department); unrelated, blank and summary/cover sheets are simply not processed."""
+    try:
+        wb = openpyxl.load_workbook(path, data_only=False)
+    except Exception as e:
+        return FileAnalysis(path, filename, valid=False, error=f"Could not open file: {e}")
+
+    sheets, skipped = [], []
+    for ws in wb.worksheets:
+        try:
+            sa, reason = _analyze_sheet(ws)
+        except Exception as e:  # one odd sheet must never take the whole workbook down
+            sa, reason = None, f"could not be read ({e})"
+        if sa is None:
+            skipped.append((ws.title, reason))
+        else:
+            sheets.append(sa)
+
+    if not sheets:
+        detail = "; ".join(f"'{n}': {r}" for n, r in skipped) or "the workbook has no worksheets"
+        return FileAnalysis(
+            path, filename, valid=False, skipped_sheets=skipped,
+            error=f"No Nursing Chart Review Checklist worksheet was found in this "
+                  f"workbook. Every worksheet was checked by its content - {detail}.",
+        )
+
+    # File-level summary, with each sheet's own notes prefixed by its name when the
+    # workbook holds more than one checklist sheet.
+    multi = len(sheets) > 1
+    warnings = []
+    for sa in sheets:
+        prefix = f"Sheet '{sa.name}': " if multi else ""
+        warnings.extend(prefix + w for w in sa.warnings)
+    units = sorted(set(u for sa in sheets for u in re.split(r" \+ ", sa.unit_name or "") if u))
     return FileAnalysis(
         path, filename, valid=True, warnings=warnings,
-        unit_name=unit_name, patient_count=len(kept_offsets), score_col=score_col,
-        avg_rows=avg_rows, section_headers=section_headers,
-        section_header_text=section_header_text,
-        kept_offsets=kept_offsets,
-        excluded_empty_count=len(excluded_offsets),
+        unit_name=" + ".join(units) if units else None,
+        patient_count=sum(sa.patient_count for sa in sheets),
+        sheets=sheets, skipped_sheets=skipped,
     )
 
 
-def compare_to_master_text(master_ws, other_analysis: FileAnalysis, other_ws) -> list:
-    """Light consistency check: flag if a file's own A/B checklist text differs from
-    the file that will serve as the master (first uploaded). Non-blocking - just a warning,
-    since only the FIRST file's A:K actually ends up in the output."""
+# ---------------------------------------------------------------------------
+# Batch planning: compatibility with the master structure + duplicate protection.
+# Used both by the review screen (from stored analyses) and by consolidate().
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SheetPlan:
+    sheet: SheetAnalysis
+    use_offsets: list  # offsets actually consolidated (kept columns minus duplicates)
+    notes: list = field(default_factory=list)
+
+
+@dataclass
+class FilePlan:
+    analysis: FileAnalysis
+    sheets: list = field(default_factory=list)  # [SheetPlan]
+    error: Optional[str] = None  # blocking incompatibility with the master structure
+    notes: list = field(default_factory=list)  # non-blocking: duplicates skipped, etc.
+
+    @property
+    def patient_count(self):
+        return sum(len(sp.use_offsets) for sp in self.sheets)
+
+    @property
+    def unit_name(self):
+        """Unit/Ward label(s) of the sheets that actually contribute patients (a sheet
+        whose patients were all skipped as duplicates doesn't add its unit)."""
+        units = sorted(set(
+            u for sp in self.sheets if sp.use_offsets
+            for u in re.split(r" \+ ", sp.sheet.unit_name or "") if u
+        ))
+        return " + ".join(units) if units else self.analysis.unit_name
+
+
+def _structure_difference(base: SheetAnalysis, other: SheetAnalysis):
+    """None if `other` can safely be combined with `base`; otherwise a specific,
+    human-readable explanation of how the two checklist structures differ. Compared on the
+    checklist's actual content - header row, section headers (text and position) and item
+    numbers - because patient answers are copied by row position, so a mismatch would put
+    answers under the wrong checklist items."""
+    if base.header_row != other.header_row:
+        return (f"its patient/Score header row is row {other.header_row}, but the master "
+                f"checklist's is row {base.header_row}")
+    if other.section_header_text != base.section_header_text:
+        a, b = base.section_header_text, other.section_header_text
+        if len(a) != len(b):
+            return (f"it has {len(b)} checklist sections ({'; '.join(b)}), but the master "
+                    f"checklist has {len(a)} ({'; '.join(a)})")
+        diff = [f"'{y}' where the master has '{x}'" for x, y in zip(a, b) if x != y]
+        return f"its section headers differ: {'; '.join(diff)}"
+    if other.section_headers != base.section_headers:
+        pairs = [f"'{t}' starts at row {y} (master: row {x})" for t, x, y in
+                 zip(base.section_header_text, base.section_headers, other.section_headers)
+                 if x != y]
+        return ("its sections are at different rows, so the items would not line up - "
+                + "; ".join(pairs[:4]) + (" ..." if len(pairs) > 4 else ""))
+    if other.item_numbers != base.item_numbers:
+        base_map, other_map = dict(base.item_numbers), dict(other.item_numbers)
+        rows = sorted(set(base_map) | set(other_map))
+        diffs = [r for r in rows if base_map.get(r) != other_map.get(r)]
+        shown = ", ".join(
+            f"row {r} (item {other_map.get(r, 'none')} vs master {base_map.get(r, 'none')})"
+            for r in diffs[:4]
+        )
+        return (f"its numbered checklist items differ from the master at {len(diffs)} "
+                f"row(s): {shown}" + (" ..." if len(diffs) > 4 else ""))
+    return None
+
+
+def plan_batch(analyses: list) -> list:
+    """Given the FileAnalysis of every uploaded file, in upload order, work out for each
+    file (a) whether its checklist sheet(s) match the master structure - the first
+    recognized sheet of the first valid file - and (b) which patient columns to actually
+    take, skipping any that duplicate a column already taken from a DIFFERENT sheet or
+    file (first occurrence in upload order wins) so no patient is counted twice.
+    Returns one FilePlan per input, same order. Pure function of the analyses."""
+    plans = [FilePlan(analysis=a) for a in analyses]
+    base = None
+    for a in analyses:
+        if a.valid and a.sheets:
+            base = a.sheets[0]
+            break
+
+    seen = {}  # column fingerprint -> (file index, sheet name) it was first taken from
+    for fi, (a, plan) in enumerate(zip(analyses, plans)):
+        if not (a.valid and a.sheets):
+            continue
+        for sa in a.sheets:
+            diff = _structure_difference(base, sa) if sa is not base else None
+            if diff:
+                where = f"sheet '{sa.name}' in {a.filename}" if len(a.sheets) > 1 else a.filename
+                plan.error = (
+                    f"{where}: {diff}. These are different checklist templates and cannot "
+                    f"be safely combined - patient data would misalign to the wrong "
+                    f"checklist items. Remove this file, or upload a file that matches the "
+                    f"master structure first (the master is the first uploaded file)."
+                )
+                break
+            use, dup_from = [], {}
+            for off, key in zip(sa.kept_offsets, sa.column_keys):
+                origin = seen.get(key) if key is not None else None
+                if origin is not None and origin != (fi, sa.name):
+                    dup_from.setdefault(origin, 0)
+                    dup_from[origin] += 1
+                    continue
+                if key is not None:
+                    seen.setdefault(key, (fi, sa.name))
+                use.append(off)
+            sp = SheetPlan(sheet=sa, use_offsets=use)
+            for (ofi, oname), n in dup_from.items():
+                src = analyses[ofi].filename
+                note = (f"{n} patient column(s) in "
+                        f"{'sheet ' + repr(sa.name) if len(a.sheets) > 1 else 'this file'} "
+                        f"duplicate patient data already taken from "
+                        f"{'sheet ' + repr(oname) + ' of ' if len(analyses[ofi].sheets) > 1 else ''}"
+                        f"{src} and were skipped so no patient is counted twice.")
+                sp.notes.append(note)
+                plan.notes.append(note)
+            plan.sheets.append(sp)
+    return plans
+
+
+def compare_to_master_text(master_ws, other_ws, first_row, last_row) -> list:
+    """Light consistency check: flag if a sheet's own A/B checklist wording differs from
+    the master sheet's. Non-blocking - just a warning (typo fixes etc. are common), since
+    only the master's A:K wording ends up in the output. Structural differences (headers,
+    item numbers, positions) are blocking and handled by _structure_difference."""
     diffs = []
-    for r in range(9, 109):
+    for r in range(first_row, last_row + 1):
         a_m, b_m = master_ws.cell(row=r, column=1).value, master_ws.cell(row=r, column=2).value
         a_o, b_o = other_ws.cell(row=r, column=1).value, other_ws.cell(row=r, column=2).value
         if _norm(a_m) != _norm(a_o) or _norm(b_m) != _norm(b_o):
             diffs.append(r)
     if diffs:
         return [
-            f"Checklist text differs from the first uploaded file at row(s) "
+            f"Checklist text differs from the master sheet at row(s) "
             f"{', '.join(str(r) for r in diffs[:6])}"
             + (f" and {len(diffs) - 6} more" if len(diffs) > 6 else "")
-            + ". Only the first uploaded file's wording is used in the output."
+            + ". Only the master sheet's wording is used in the output."
         ]
     return []
+
+
 
 
 def _copy_cell_style(src_cell, dst_cell):
@@ -528,7 +750,7 @@ def _resolve_dropdown_values(wb, ws, formula1: str):
     return values, None
 
 
-def _find_section_headers(ws) -> list:
+def _find_section_headers(ws, header_row: int) -> list:
     """Find every section-header row: column A holds text matching the established
     'X. SECTION NAME' pattern (a single capital letter, a period, then the section
     name) - e.g. 'A. INITIAL ASSESSMENT', 'F.NURSING PROGRESS NOTES'. This is the
@@ -540,7 +762,7 @@ def _find_section_headers(ws) -> list:
     checklist has 5 sections or 20."""
     last_row = min(ws.max_row, STRUCTURE_SCAN_LIMIT)
     rows = []
-    for r in range(9, last_row + 1):
+    for r in range(header_row + 1, last_row + 1):
         v = ws.cell(row=r, column=1).value
         if isinstance(v, str) and _SECTION_HEADER_RE.match(v.strip()):
             rows.append(r)
@@ -648,7 +870,7 @@ def _build_summary_sheet(wb, checklist_ws, boundaries, score_col_letter):
     shrinks to fit however many sections were actually detected."""
     if SHEET_SUMMARY in wb.sheetnames:
         del wb[SHEET_SUMMARY]
-    summary_ws = wb.create_sheet(SHEET_SUMMARY, index=1)
+    summary_ws = wb.create_sheet(SHEET_SUMMARY, index=wb.index(checklist_ws) + 1)
 
     summary_first_row = SUMMARY_HEADER_ROW + 1
     summary_last_row = summary_first_row + len(boundaries) - 1
@@ -681,7 +903,7 @@ def _build_summary_sheet(wb, checklist_ws, boundaries, score_col_letter):
 
         score_cell = summary_ws.cell(
             row=summary_row, column=SUMMARY_FORMULA_COL,
-            value=f"='{SHEET_CHECKLIST}'!{score_col_letter}{avg_row}",
+            value=f"='{checklist_ws.title}'!{score_col_letter}{avg_row}",
         )
         score_cell.font = _SUMMARY_SCORE_FONT
         score_cell.alignment = center
@@ -697,10 +919,43 @@ def _build_summary_sheet(wb, checklist_ws, boundaries, score_col_letter):
     return summary_ws
 
 
+def _retarget_sheet_refs(text, old, new):
+    """Rewrite references to sheet `old` as `new` inside a formula/defined-name string
+    (quoted or bare). Used when the consolidated sheet is renamed to its canonical name."""
+    if not text or old == new:
+        return text
+    quoted_new = "'" + new.replace("'", "''") + "'"
+    text = text.replace("'" + old.replace("'", "''") + "'!", quoted_new + "!")
+    if re.fullmatch(r"[A-Za-z_][\w.]*", old):
+        text = re.sub(rf"(?<![\w'.]){re.escape(old)}!", quoted_new + "!", text)
+    return text
+
+
+def _rename_checklist_sheet(wb, ws, new_name):
+    """Give the consolidated sheet the canonical checklist name, whatever the source
+    sheet was called - and keep every reference that pointed at the old name (defined
+    names, e.g. a dropdown list's source) pointing at the renamed sheet. Returns the
+    (old, new) names actually used. If another sheet already owns the canonical name the
+    source's own name is kept, so nothing is ever overwritten."""
+    old = ws.title
+    if old == new_name or new_name in wb.sheetnames:
+        return old, old
+    ws.title = new_name
+    for dn in list(wb.defined_names.values()):
+        if dn.attr_text:
+            dn.attr_text = _retarget_sheet_refs(dn.attr_text, old, new_name)
+    for sheet in wb.worksheets:
+        for dn in list(sheet.defined_names.values()):
+            if dn.attr_text:
+                dn.attr_text = _retarget_sheet_refs(dn.attr_text, old, new_name)
+    return old, new_name
+
+
 def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
     """
     ordered_paths_and_names: list of (filepath, original_filename) tuples, in the exact
     order patient columns should appear (upload order).
+    Every recognized checklist worksheet of every file contributes its patient columns.
     Returns a dict report of what was done (for display / audit).
     """
     if not ordered_paths_and_names:
@@ -713,86 +968,43 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
             raise ValidationError(f"{name}: {info.error}")
         infos.append(info)
 
-    # --- Base workbook = the FIRST uploaded file, used as-is for its A:K master structure ---
-    base_path = infos[0].path
-    wb = openpyxl.load_workbook(base_path, data_only=False)
-    ws = wb[SHEET_CHECKLIST]
-    base_score_col = infos[0].score_col
+    # Compatibility with the master structure + duplicate-patient protection (see
+    # plan_batch). Anything that would put answers under the wrong checklist items stops
+    # the run here with a specific explanation.
+    plans = plan_batch(infos)
+    for plan in plans:
+        if plan.error:
+            raise ValidationError(plan.error)
 
-    # Capture the base file's OWN dropdown/list-validation template (allowed values +
+    # --- Base workbook = the FIRST recognized checklist sheet of the FIRST uploaded file,
+    #     used as-is for its A:K master structure ---
+    base_info = infos[0]
+    base_sa = base_info.sheets[0]
+    wb = openpyxl.load_workbook(base_info.path, data_only=False)
+    ws = wb[base_sa.name]
+    base_score_col = base_sa.score_col
+    header_row = base_sa.header_row
+
+    # Capture the base sheet's OWN dropdown/list-validation template (allowed values +
     # behavior) before anything is touched - see _capture_source_validation for why this
     # must never be a hardcoded assumption about where the allowed-values list lives.
     source_validation = _capture_source_validation(ws)
 
-    # Actually resolve that source to real values - the same resolution Excel/Calc does
-    # to populate the dropdown - rather than just trusting the DataValidation object
-    # exists. Handles a direct literal list, a same-sheet range, or a defined name
-    # pointing anywhere (including a hidden sheet). Logged either way so this is checked
-    # on every single run, not just when someone happens to open the file and click a
-    # cell by hand.
-    dropdown_values, dropdown_resolution_note = [], None
-    if source_validation:
-        dropdown_values, dropdown_resolution_note = _resolve_dropdown_values(
-            wb, ws, source_validation["formula1"]
-        )
-        if not dropdown_values:
-            dropdown_resolution_note = (
-                dropdown_resolution_note
-                or f"'{source_validation['formula1']}' resolved to zero non-blank values"
-            )
-
-    # A source file's own SUMMSRY sheet, if present, is never used - see module docstring.
-    # (The final Summary is built fresh at the end, from the consolidated checklist only.)
-
-    # Derive the base file's section structure from its actual header/item CONTENT -
-    # never from whether a section-average formula happens to still work there (see
-    # module docstring). However many sections that turns out to be is fine: a
-    # 9-section checklist and a 12-section checklist are both valid on their own.
-    section_headers = _find_section_headers(ws)
-    if not section_headers:
-        # analyze_file() already guarantees this for every file, including this one, on
-        # its own earlier read - this is just a defensive re-check against the fresh copy
-        # of the file loaded here.
-        raise ValidationError(
-            f"{infos[0].filename}: could not detect any section headers in the master "
-            f"file's checklist - cannot determine its structure."
-        )
+    # The section structure, from the base sheet's actual header/item CONTENT - never from
+    # whether a section-average formula happens to still work. Every other sheet has
+    # already been verified (plan_batch) to have exactly this structure.
+    section_headers = base_sa.section_headers
     boundaries = _compute_boundaries(ws, section_headers)
     avg_rows = [b[0] for b in boundaries]
     avg_row_set = set(avg_rows)
-    section_header_text = [_norm(ws.cell(row=h, column=1).value) for h in section_headers]
-
-    # Every OTHER file must use the SAME checklist template as the master (first
-    # uploaded) file - patient columns are copied by absolute row position, so if a
-    # file's own section headers sit at different rows, or say something different,
-    # its item rows don't line up with the master's either, and blindly copying its
-    # patient values would silently attach them to the wrong checklist items. This
-    # compares actual section-header row positions and text - NEVER whether a nearby
-    # average formula happens to still work, since that cell is routinely overwritten
-    # by manual editing in real files without the checklist itself being any
-    # different (confirmed directly: P2CD and PICU have byte-identical headers and
-    # item text at every one of their 12 sections, despite 1-3 average cells each
-    # having been clobbered with "NA" or a hard-typed number - they are the same
-    # template and are correctly treated as compatible here).
-    for info in infos[1:]:
-        if info.section_headers != section_headers or info.section_header_text != section_header_text:
-            raise ValidationError(
-                f"{info.filename}: this file's checklist sections are at rows "
-                f"{info.section_headers} ({info.section_header_text}), but the master "
-                f"file ({infos[0].filename}, uploaded first) has sections at rows "
-                f"{section_headers} ({section_header_text}). These appear to be "
-                f"different checklist templates and can't be safely combined - patient "
-                f"data would misalign to the wrong checklist items. Remove this file, "
-                f"or reorder so a file matching this structure is uploaded first."
-            )
 
     # How far into the patient columns to copy: past the last detected section-average
     # row, plus a little padding for any trailing blank/signature rows below the last
     # section - not a fixed row ceiling, so a shorter or taller checklist both work.
     copy_last_row = max(avg_rows) + TRAILING_ROW_PADDING
 
-    # --- Capture the base file's own Score-column style (font/border/fill/etc per row)
-    #     and width, BEFORE that column gets overwritten by the next file's data. This is
+    # --- Capture the base sheet's own Score-column style (font/border/fill/etc per row)
+    #     and width, BEFORE that column gets overwritten by the next source's data. This is
     #     reused for the brand-new final Score column at the end. ---
     score_style_by_row = {}
     for r in range(1, copy_last_row + 1):
@@ -808,9 +1020,8 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
     if dim and dim.width:
         score_col_width = dim.width
 
-    # Fallback width for any patient column whose source file never set one explicitly
-    # (see _copy_patient_column docstring) - use the master file's own first patient
-    # column (L) as the sane default.
+    # Fallback width for any patient column whose source never set one explicitly (see
+    # _set_column_width) - use the master sheet's own first patient column (L).
     l_dim = ws.column_dimensions.get("L")
     fallback_patient_width = l_dim.width if (l_dim and l_dim.width) else 10.0
 
@@ -822,50 +1033,64 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
         ws, PATIENT_START_COL, base_score_col
     )
 
-    # --- Place every file's patient columns, in upload order ---
+    # --- Place every recognized sheet's patient columns, in upload order (file by file,
+    #     and sheet by sheet within a file) ---
     report_files = []
     current_col = PATIENT_START_COL
     running_index = 0
-    for i, info in enumerate(infos):
-        if i > 0:
-            src_wb = openpyxl.load_workbook(info.path, data_only=False)
-            src_ws = src_wb[SHEET_CHECKLIST]
-            # This file is only ever READ from below, never saved - but if IT has its own
-            # unusual merge in the patient-column area (e.g. a Unit/Ward label merged
-            # across a few of its own patient columns), reading a non-anchor merged
-            # cell's .value returns None, silently losing that patient's data on copy.
-            # Same fix as the base file gets, applied here too: dissolve any such merge
-            # and propagate the anchor's value first, so every cell we're about to copy
-            # from is a real, independently-readable value.
-            _, _, src_other_merge_count = _sweep_merges_in_region(src_ws, PATIENT_START_COL, info.score_col)
-            warnings = list(info.warnings) + compare_to_master_text(ws, info, src_ws)
-            if src_other_merge_count:
-                warnings.append(
-                    f"{src_other_merge_count} unexpected merged cell(s) found in this "
-                    f"file's own patient columns - resolved (value copied to every cell "
-                    f"the merge covered) before reading its patient data."
-                )
-        else:
-            src_ws = ws  # first file: data's already in place, nothing to copy
-            warnings = list(info.warnings)
-
+    loaded = {}  # path -> workbook, for files other than the base (read-only use)
+    for fi, (info, plan) in enumerate(zip(infos, plans)):
+        warnings = list(info.warnings) + list(plan.notes)
         start_col = current_col
-        for offset in info.kept_offsets:
-            src_col = PATIENT_START_COL + offset
-            dst_col = current_col
-            running_index += 1
-            if not (i == 0 and dst_col == src_col):
-                _copy_patient_column(src_ws, src_col, ws, dst_col, copy_last_row)
-            _set_column_width(src_ws, src_col, ws, dst_col, fallback_patient_width)
-            _ensure_writable(ws, HEADER_ROW, dst_col)
-            ws.cell(row=HEADER_ROW, column=dst_col).value = running_index
-            current_col += 1
+        for sp in plan.sheets:
+            sa = sp.sheet
+            if fi == 0 and sa is base_sa:
+                src_ws = ws  # base sheet: data's already in place, nothing to copy
+            else:
+                if fi == 0:
+                    src_wb = wb  # another checklist sheet of the base workbook
+                else:
+                    if info.path not in loaded:
+                        loaded[info.path] = openpyxl.load_workbook(info.path, data_only=False)
+                    src_wb = loaded[info.path]
+                src_ws = src_wb[sa.name]
+                # This sheet is only ever READ from below, never saved - but if IT has its
+                # own unusual merge in the patient-column area (e.g. a Unit/Ward label
+                # merged across a few of its patient columns), reading a non-anchor merged
+                # cell's .value returns None, silently losing that patient's data on copy.
+                # Same fix as the base sheet gets: dissolve any such merge and propagate
+                # the anchor's value first, so every cell we copy from is a real value.
+                _, _, src_other_merge_count = _sweep_merges_in_region(
+                    src_ws, PATIENT_START_COL, sa.score_col
+                )
+                warnings += compare_to_master_text(ws, src_ws, header_row, max(avg_rows))
+                if src_other_merge_count:
+                    warnings.append(
+                        f"{src_other_merge_count} unexpected merged cell(s) found in the "
+                        f"patient columns of '{sa.name}' - resolved (value copied to every "
+                        f"cell the merge covered) before reading its patient data."
+                    )
 
+            for offset in sp.use_offsets:
+                src_col = PATIENT_START_COL + offset
+                dst_col = current_col
+                running_index += 1
+                if not (src_ws is ws and dst_col == src_col):
+                    _copy_patient_column(src_ws, src_col, ws, dst_col, copy_last_row)
+                _set_column_width(src_ws, src_col, ws, dst_col, fallback_patient_width)
+                _ensure_writable(ws, header_row, dst_col)
+                ws.cell(row=header_row, column=dst_col).value = running_index
+                current_col += 1
+        loaded.pop(info.path, None)
+
+        got = current_col - start_col
         report_files.append({
-            "filename": info.filename, "unit": info.unit_name,
-            "patient_count": info.patient_count,
-            "excluded_empty_count": info.excluded_empty_count,
-            "columns": f"{get_column_letter(start_col)}:{get_column_letter(current_col - 1)}",
+            "filename": info.filename, "unit": plan.unit_name,
+            "patient_count": got,
+            "excluded_empty_count": sum(sp.sheet.excluded_empty_count for sp in plan.sheets),
+            "sheets": [sp.sheet.name for sp in plan.sheets],
+            "columns": (f"{get_column_letter(start_col)}:{get_column_letter(current_col - 1)}"
+                        if got else "—"),
             "warnings": warnings,
         })
 
@@ -874,10 +1099,14 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
     last_patient_letter = get_column_letter(final_score_col - 1)
     total_patients = running_index
 
-    # --- Write the new consolidated Score column ---
+    # --- Write the new consolidated Score column. Whatever previously sat in this column
+    #     (an old patient column, or the old Score column) is cleared first so no stale
+    #     value from a source file can survive in it. ---
     for r in range(1, copy_last_row + 1):
         style = score_style_by_row[r]
         cell = _ensure_writable(ws, r, final_score_col)
+        if r > header_row:
+            cell.value = None
         cell.font = style["font"]
         cell.border = style["border"]
         cell.fill = style["fill"]
@@ -885,20 +1114,13 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
         cell.number_format = style["number_format"]
         cell.protection = style["protection"]
 
-    ws.cell(row=HEADER_ROW, column=final_score_col).value = "Score"
-
-    # `boundaries` was already derived from the base file's section headers/item content
-    # right after it was loaded (columns A/B, which nothing in this function ever
-    # touches) - reused as-is here rather than recomputed, since recomputing against
-    # `avg_rows` would be interpreting average-row positions as if they were header
-    # positions, which they aren't.
+    ws.cell(row=header_row, column=final_score_col).value = "Score"
 
     # Decide, per item row, whether a per-item formula is safe to write - based on the
-    # ACTUAL consolidated patient data we just placed, not on any single source file's
-    # own (possibly smaller / all-"NA") patient set. A row where every uploaded patient
-    # is "NA" would divide by zero, so it's deliberately left blank, exactly matching
-    # the master template's own convention (confirmed: rows that are all-"NA" even
-    # across 70 patients in the reference report are left blank there too).
+    # ACTUAL consolidated patient data we just placed, not on any single source's own
+    # (possibly smaller / all-"NA") patient set. A row where every patient is "NA" would
+    # divide by zero, so it's deliberately left blank, exactly matching the master
+    # template's own convention.
     formula_item_rows, blank_item_rows = [], []
     for avg_row, start, end in boundaries:
         for r in range(start, end + 1):
@@ -939,9 +1161,36 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
     if ws.max_column > final_score_col:
         ws.delete_cols(final_score_col + 1, ws.max_column - final_score_col)
 
+    # --- The other checklist sheets of the base workbook have been merged into this one;
+    #     drop them so the output holds a single consolidated checklist. Unrelated
+    #     VISIBLE sheets from the base workbook (cover pages, blank sheets) are not part of
+    #     the report and are dropped too. Anything a dropdown or defined name may depend on
+    #     is kept: hidden / very-hidden sheets, and any sheet whose name is referenced by a
+    #     defined name or by the validation source. ---
+    checklist_names = {sa.name for sa in base_info.sheets}
+    reference_text = " ".join(
+        [dn.attr_text or "" for dn in wb.defined_names.values()]
+        + [(source_validation or {}).get("formula1") or "", (source_validation or {}).get("formula2") or ""]
+    )
+    for sheet in list(wb.worksheets):
+        if sheet is ws or sheet.title == SHEET_SUMMARY:
+            continue
+        needed = (
+            sheet.sheet_state != "visible"
+            or (sheet.title not in checklist_names and sheet.title in reference_text)
+        )
+        if not needed:
+            del wb[sheet.title]
+
+    # --- Canonical sheet name, whatever the source sheet was called ---
+    old_title, new_title = _rename_checklist_sheet(wb, ws, SHEET_CHECKLIST)
+    if source_validation:
+        for key in ("formula1", "formula2"):
+            source_validation[key] = _retarget_sheet_refs(source_validation[key], old_title, new_title)
+
     # --- Rebuild data validation (the 0/1/2/NA dropdown) across the new patient column
-    #     width, using the base file's OWN validation template captured at the very start
-    #     (source_validation) - never a hardcoded reference. If the base file didn't have
+    #     width, using the base sheet's OWN validation template captured at the very start
+    #     (source_validation) - never a hardcoded reference. If the base sheet didn't have
     #     a list validation to model this on, no dropdown is fabricated from nothing. ---
     row_blocks = [(start, end) for _avg_row, start, end in boundaries]
     ws.data_validations.dataValidation = []
@@ -967,10 +1216,31 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
         ws.add_data_validation(dv)
         dropdown_rebuilt = True
 
+    # Actually resolve the dropdown source to real values against the FINAL workbook - the
+    # same resolution Excel does to populate the dropdown - rather than just trusting the
+    # DataValidation object exists. Handles a literal list, a same-sheet range, or a
+    # defined name pointing anywhere (including a hidden sheet).
+    dropdown_values, dropdown_resolution_note = [], None
+    if source_validation:
+        dropdown_values, dropdown_resolution_note = _resolve_dropdown_values(
+            wb, ws, source_validation["formula1"]
+        )
+        if not dropdown_values:
+            dropdown_resolution_note = (
+                dropdown_resolution_note
+                or f"'{source_validation['formula1']}' resolved to zero non-blank values"
+            )
+
     # --- Build a brand-new SUMMSRY sheet from the consolidated checklist only.
     #     Never reads or copies any source workbook's own SUMMSRY sheet (some don't have
     #     one at all - that's fine, this doesn't depend on it either way). ---
     _build_summary_sheet(wb, ws, boundaries, final_score_letter)
+
+    # Only the consolidated checklist is selected/active (deleting sheets can otherwise
+    # leave several tabs "selected", which makes Excel open in group-edit mode).
+    wb.active = wb.index(ws)
+    for sheet in wb.worksheets:
+        sheet.sheet_view.tabSelected = sheet is ws
 
     wb.save(output_path)
 
@@ -999,6 +1269,7 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
         "total_patients": total_patients,
         "score_column": final_score_letter,
         "files": report_files,
+        "checklist_sheet": ws.title,
         "section_average_rows": avg_rows,
         "blank_item_rows": blank_item_rows,
         "formula_item_rows_count": len(formula_item_rows),

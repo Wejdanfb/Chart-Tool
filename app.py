@@ -23,7 +23,7 @@ from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file, render_template
 
-from consolidate import analyze_file, consolidate, ValidationError
+from consolidate import analyze_file, consolidate, plan_batch, FileAnalysis, ValidationError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,6 +134,45 @@ def _sanitize_output_filename(raw: str):
     return name or None
 
 
+def _public_records(records):
+    """What the browser sees for each file in the batch. Computed fresh from the stored
+    per-file analyses every time (no workbook is re-read), because two things depend on
+    the WHOLE batch and its current order: whether a file's checklist structure matches the
+    master (the first uploaded file), and which patient columns are duplicates of ones
+    already taken from an earlier sheet/file. Blocking problems -> valid=False + error;
+    everything else (multiple units, skipped duplicates, damaged averages...) -> warnings,
+    which the UI shows only as a hover/tap tooltip."""
+    analyses = []
+    for r in records:
+        if r.get("analysis"):
+            analyses.append(FileAnalysis.from_dict(r["analysis"]))
+        else:  # record stored by an older version of the app
+            analyses.append(FileAnalysis(r.get("path", ""), r["filename"], bool(r.get("valid")),
+                                         error=r.get("error"), warnings=r.get("warnings", []),
+                                         unit_name=r.get("unit_name"),
+                                         patient_count=r.get("patient_count", 0)))
+    plans = plan_batch(analyses)
+    out = []
+    for r, a, p in zip(records, analyses, plans):
+        valid = a.valid and not p.error
+        if valid:
+            warnings, patient_count = list(a.warnings) + list(p.notes), p.patient_count
+        else:
+            warnings, patient_count = [], a.patient_count
+        out.append({
+            "file_id": r["file_id"],
+            "filename": r["filename"],
+            "valid": valid,
+            "error": a.error or p.error,
+            "error_kind": None if valid else ("incompatible" if a.valid else "unrecognized"),
+            "warnings": warnings,
+            "unit_name": p.unit_name if valid else a.unit_name,
+            "patient_count": patient_count,
+            "sheets": [s.name for s in a.sheets],
+        })
+    return out
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -182,9 +221,13 @@ def upload():
             "warnings": info.warnings,
             "unit_name": info.unit_name,
             "patient_count": info.patient_count,
+            "analysis": info.to_dict(),  # per-sheet findings; see _public_records
         }
         new_records.append(record)
-        results.append({k: v for k, v in record.items() if k != "path"})
+        results.append({k: v for k, v in record.items() if k not in ("path", "analysis")})
+        # Internal diagnostics (never shown on the page except as a hover tooltip).
+        for sheet_name, reason in info.skipped_sheets:
+            logger.info("[%s] sheet '%s' not treated as a checklist: %s", original_name, sheet_name, reason)
 
     # Append to whatever is already stored for this batch (another request/worker may
     # have added files meanwhile), under a lock.
@@ -200,7 +243,7 @@ def get_batch(batch_id):
     records = BATCHES.get(batch_id, [])
     return jsonify({
         "batch_id": batch_id,
-        "files": [{k: v for k, v in r.items() if k != "path"} for r in records],
+        "files": _public_records(records),
     })
 
 
@@ -212,7 +255,7 @@ def remove_file(batch_id, file_id):
         records = BATCHES.get(batch_id, [])
         BATCHES[batch_id] = [r for r in records if r["file_id"] != file_id]
         remaining = BATCHES.get(batch_id)
-    return jsonify({"files": [{k: v for k, v in r.items() if k != "path"} for r in remaining]})
+    return jsonify({"files": _public_records(remaining)})
 
 
 @app.route("/api/batch/<batch_id>/reorder", methods=["POST"])
@@ -238,8 +281,11 @@ def generate():
     if not records:
         return jsonify({"error": "No files in this batch."}), 400
 
-    invalid = [r for r in records if not r["valid"]]
+    invalid = [r for r in _public_records(records) if not r["valid"]]
     if invalid:
+        details = " ".join(r["error"] for r in invalid if r["error"])
+        if details:  # the messages already name the files and sheets involved
+            return jsonify({"error": "Cannot generate - " + details}), 400
         return jsonify({
             "error": "Cannot generate - some files failed validation.",
             "invalid_files": [r["filename"] for r in invalid],
