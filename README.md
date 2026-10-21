@@ -64,8 +64,8 @@ process running on your own machine, and all files stay in this folder's
   mismatch, but won't block generation over it).
 - **Worksheets are recognized by their content, never by their name.**
   Every worksheet in every uploaded workbook is inspected. One counts as
-  a checklist when it has section headers in column A (rows like
-  "A. INITIAL ASSESSMENT"), numbered checklist items under them, patient
+  a checklist when it has sections (blocks of numbered checklist items, each
+  with a heading row above it and a blank average row below), patient
   columns starting at column L, and a column labeled `Score` in the
   header row (row 9). It can be called anything — `Sheet1`, `ICU Jan`,
   the original `Nursing Chart Review Checklist` — and sit anywhere in the
@@ -103,24 +103,33 @@ process running on your own machine, and all files stay in this folder's
   that item, the formula is included.
 - **The number of sections is never assumed.** How many sections a
   checklist has — 9, 12, or any other count — is detected from the
-  checklist's actual CONTENT: section headers in column A (rows like
-  "A. INITIAL ASSESSMENT"), never from whether a section-average formula
+  checklist's actual STRUCTURE: blocks of numbered items, each with a
+  heading row above it, never from whether a section-average formula
   happens to still exist there. Real monthly files regularly have that
   one cell overwritten with "NA", a hard-typed number, or left blank by
   manual editing — that's a data-quality blemish in a single cell, not
   evidence the section is missing. Confirmed directly against two real
-  files (P2CD, PICU): identical headers and item text at all 12
+  files (P2CD, PICU): identical section positions and item text at all 12
   sections, despite 1–3 average cells each having been individually
   damaged — both correctly recognized as the same 12-section template.
+- **Section heading wording is never validated.** The heading rows
+  (14, 32, 36, 50, 55, 63, 68, 73, 89, 93, 104, 111 in the standard
+  template, and any other heading row a sheet has) may be blank, worded
+  differently, or carry other text/formatting - the file is still accepted
+  and raises no warning. Sections are located from the numbered items and
+  average rows instead, so nothing depends on a heading's text. The
+  consolidated report keeps the master file's headings as they are (a blank
+  heading stays blank - no text is ever invented), and all Score, average
+  and Summary formulas are unaffected.
 - **Every other checklist sheet must use the exact same checklist
-  structure as the master sheet** — same section headers, at the same
+  structure as the master sheet** — same sections at the same
   row positions, and the same item numbering. Since patient columns are placed by row position, a
-  file whose own section headers sit at different rows (or say
-  something different) than the master's is a genuinely different
+  file whose own sections start at different rows than the master's
+  is a genuinely different
   checklist template, and combining it would silently attach its
   patients' data to the wrong checklist items. A damaged average
-  formula never factors into this comparison — only the actual header
-  text and position do, so a file is never wrongly rejected just
+  formula never factors into this comparison — only the actual section
+  positions and item numbers do, so a file is never wrongly rejected just
   because one of its cells got overwritten. The tool checks this for
   every file before generating anything, and refuses with a specific
   explanation (both files' section positions and headers, spelled out)
@@ -222,10 +231,10 @@ the tool. Worth checking that window if a report ever looks off.
 
 **Not recognized** means no worksheet in the file looks like a checklist
 (the tooltip lists every worksheet and why it was skipped — typically a
-missing `Score` header in row 9, no "A. ..." section headers, or no
+missing `Score` header in row 9, no recognizable checklist sections, or no
 numbered items). **Not compatible** means a checklist worksheet was
 found but its structure differs from the master (the first file in the
-list): the tooltip names the sheet and spells out which section headers,
+list): the tooltip names the sheet and spells out which section positions,
 rows or item numbers differ. Either remove that file, or put a file that
 matches the others first. A missing `SUMMSRY` sheet, or a different
 worksheet name, is never a reason for rejection.

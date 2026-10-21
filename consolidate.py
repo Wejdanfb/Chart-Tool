@@ -121,10 +121,18 @@ SUMMARY_HEADER_ROW = 17  # layout choice for the tool's OWN generated sheet - no
 SUMMARY_LABEL_COL = 3  # C
 SUMMARY_FORMULA_COL = 4  # D
 
-# A section header row always looks like "A. SOME NAME" / "F.SOME NAME" (a single
-# capital letter, a period, then the section name) in every real file seen so far -
-# never a formula or number. This is the actual evidence a section exists.
+# Section heading rows are normally titled "A. SOME NAME" / "F.SOME NAME". That wording is
+# only a convention - it is NEVER required: sections are found from the checklist's
+# structure (numbered items, average rows - see _find_section_headers) and a heading may be
+# blank or worded differently. This pattern is only used as an extra hint (see there).
 _SECTION_HEADER_RE = re.compile(r"^[A-Z]\.")
+
+# Rows of the standard checklist template that carry a section heading (row 73 as supplied;
+# the heading of section H sits on row 79 in the current template and is found
+# structurally). The TEXT of these rows - and of every heading row a sheet is found to have
+# - is never compared or validated: blank, reworded or reformatted headings are all
+# accepted. Everything else about the structure is still checked.
+TITLE_EXEMPT_ROWS = frozenset({14, 32, 36, 50, 55, 63, 68, 73, 89, 93, 104, 111})
 _ITEM_NUMBER_RE = re.compile(r"^\d+\.?$")
 _UNIT_LABEL_RE = re.compile(r"unit\s*/?\s*ward", re.IGNORECASE)
 
@@ -244,10 +252,12 @@ def _analyze_sheet(ws, extract_out=None):
     # its real value. See _sweep_merges_in_region.
     _, _, merge_other_count = _sweep_merges_in_region(ws, PATIENT_START_COL, score_col)
 
-    section_headers = _find_section_headers(ws, header_row)
+    section_headers, header_problem = _find_section_headers(ws, header_row, score_col)
+    if header_problem:
+        return None, header_problem
     if not section_headers:
-        return None, ("no section headers found (column A should have rows like "
-                      "'A. INITIAL ASSESSMENT')")
+        return None, ("no checklist sections found (expected blocks of numbered items "
+                      "separated by a blank average row)")
     boundaries = _compute_boundaries(ws, section_headers)
     avg_rows = [b[0] for b in boundaries]
     section_header_text = [_norm(ws.cell(row=h, column=1).value) for h in section_headers]
@@ -302,7 +312,8 @@ def _analyze_sheet(ws, extract_out=None):
         )
 
     # Data-quality note only, never a structural one (see _section_has_working_average).
-    damaged = [section_header_text[i] for i, avg_row in enumerate(avg_rows)
+    damaged = [section_header_text[i] or f"the section at row {section_headers[i]}"
+               for i, avg_row in enumerate(avg_rows)
                if not _section_has_working_average(ws, score_col, avg_row)]
     if damaged:
         warnings.append(
@@ -474,30 +485,39 @@ class FilePlan:
         return " + ".join(units) if units else self.analysis.unit_name
 
 
+def _title_exempt_rows(*sheets) -> set:
+    """Rows whose heading text/number is never validated: the fixed template heading rows
+    plus every heading row actually found in the sheet(s) being compared."""
+    rows = set(TITLE_EXEMPT_ROWS)
+    for sa in sheets:
+        rows.update(sa.section_headers)
+    return rows
+
+
 def _structure_difference(base: SheetAnalysis, other: SheetAnalysis):
     """None if `other` can safely be combined with `base`; otherwise a specific,
     human-readable explanation of how the two checklist structures differ. Compared on the
-    checklist's actual content - header row, section headers (text and position) and item
-    numbers - because patient answers are copied by row position, so a mismatch would put
+    checklist's actual structure - header row, section positions and item numbers (never
+    the wording of a section heading) - because patient answers are copied by row position, so a mismatch would put
     answers under the wrong checklist items."""
     if base.header_row != other.header_row:
         return (f"its patient/Score header row is row {other.header_row}, but the master "
                 f"checklist's is row {base.header_row}")
-    if other.section_header_text != base.section_header_text:
-        a, b = base.section_header_text, other.section_header_text
-        if len(a) != len(b):
-            return (f"it has {len(b)} checklist sections ({'; '.join(b)}), but the master "
-                    f"checklist has {len(a)} ({'; '.join(a)})")
-        diff = [f"'{y}' where the master has '{x}'" for x, y in zip(a, b) if x != y]
-        return f"its section headers differ: {'; '.join(diff)}"
+    # Heading WORDING is deliberately not compared (blank / reworded headings are fine); the
+    # sections themselves - how many there are and where each starts - are.
+    if len(other.section_headers) != len(base.section_headers):
+        return (f"it has {len(other.section_headers)} checklist sections (starting at rows "
+                f"{other.section_headers}), but the master checklist has "
+                f"{len(base.section_headers)} (starting at rows {base.section_headers})")
     if other.section_headers != base.section_headers:
-        pairs = [f"'{t}' starts at row {y} (master: row {x})" for t, x, y in
-                 zip(base.section_header_text, base.section_headers, other.section_headers)
-                 if x != y]
+        pairs = [f"section {i + 1} starts at row {y} (master: row {x})" for i, (x, y) in
+                 enumerate(zip(base.section_headers, other.section_headers)) if x != y]
         return ("its sections are at different rows, so the items would not line up - "
                 + "; ".join(pairs[:4]) + (" ..." if len(pairs) > 4 else ""))
-    if other.item_numbers != base.item_numbers:
-        base_map, other_map = dict(base.item_numbers), dict(other.item_numbers)
+    exempt = _title_exempt_rows(base, other)
+    base_map = {r: n for r, n in base.item_numbers if r not in exempt}
+    other_map = {r: n for r, n in other.item_numbers if r not in exempt}
+    if other_map != base_map:
         rows = sorted(set(base_map) | set(other_map))
         diffs = [r for r in rows if base_map.get(r) != other_map.get(r)]
         shown = ", ".join(
@@ -625,11 +645,14 @@ def _apply_extracted_column(extract, offset, dst_ws, dst_col, last_row, style_ca
         style_cache[cache_key] = copy.copy(dst_cell._style)
 
 
-def compare_extract_text(master_ws, extract, first_row, last_row) -> list:
+def compare_extract_text(master_ws, extract, first_row, last_row, master_headers=None) -> list:
     """Same check as compare_to_master_text, against the A/B wording captured when the
     other sheet was read."""
     diffs = []
+    skip = TITLE_EXEMPT_ROWS | set(master_headers or ())  # heading wording is never compared
     for r in range(first_row, last_row + 1):
+        if r in skip:
+            continue
         a_m, b_m = _norm(master_ws.cell(row=r, column=1).value), _norm(master_ws.cell(row=r, column=2).value)
         a_o, b_o = extract["text"].get(r, ("", ""))
         if a_m != a_o or b_m != b_o:
@@ -644,13 +667,16 @@ def compare_extract_text(master_ws, extract, first_row, last_row) -> list:
     return []
 
 
-def compare_to_master_text(master_ws, other_ws, first_row, last_row) -> list:
+def compare_to_master_text(master_ws, other_ws, first_row, last_row, master_headers=None) -> list:
     """Light consistency check: flag if a sheet's own A/B checklist wording differs from
     the master sheet's. Non-blocking - just a warning (typo fixes etc. are common), since
     only the master's A:K wording ends up in the output. Structural differences (headers,
     item numbers, positions) are blocking and handled by _structure_difference."""
     diffs = []
+    skip = TITLE_EXEMPT_ROWS | set(master_headers or ())  # heading wording is never compared
     for r in range(first_row, last_row + 1):
+        if r in skip:
+            continue
         a_m, b_m = master_ws.cell(row=r, column=1).value, master_ws.cell(row=r, column=2).value
         a_o, b_o = other_ws.cell(row=r, column=1).value, other_ws.cell(row=r, column=2).value
         if _norm(a_m) != _norm(a_o) or _norm(b_m) != _norm(b_o):
@@ -900,23 +926,84 @@ def _resolve_dropdown_values(wb, ws, formula1: str):
     return values, None
 
 
-def _find_section_headers(ws, header_row: int) -> list:
-    """Find every section-header row: column A holds text matching the established
-    'X. SECTION NAME' pattern (a single capital letter, a period, then the section
-    name) - e.g. 'A. INITIAL ASSESSMENT', 'F.NURSING PROGRESS NOTES'. This is the
-    actual evidence a section exists in this checklist - never whether a nearby
-    average formula happens to still work, since in real files that cell gets
-    overwritten by manual editing (NA, a hard-typed number, left blank) far more
-    often than the header text itself changes. Scans generously (bounded by the
-    sheet's own used range, capped only as a safety ceiling) so this works whether a
-    checklist has 5 sections or 20."""
+def _find_section_headers(ws, header_row: int, score_col: int):
+    """Find every section's heading row from the checklist's STRUCTURE, not from what the
+    heading says. Returns (rows, problem): `problem` is None, or a message when a section's
+    heading row cannot be placed (the sheet is then not treated as a checklist).
+
+    Structure used: a section is a run of consecutive rows (columns A/B not both blank)
+    that contains numbered items; it is closed by a row where A and B are both blank (its
+    average row). Within a run the heading row is
+      * the row directly above its first numbered item, if it has no patient responses
+        (whatever it says - "A. INITIAL ASSESSMENT", other wording, anything), or
+      * the blank row just above the run, if the run starts straight away with an item
+        (i.e. the heading cell was left blank).
+    Runs without numbered items (the Medical Record Number / Date rows, the legend, signature
+    lines) are not sections. A row whose column A matches the traditional 'X. NAME' pattern is
+    additionally accepted as a heading, as before, so layouts that put sections back to back
+    without a blank row keep working. Heading wording is never validated.
+    Scans generously (bounded by the sheet's used range, capped only as a safety ceiling)
+    so this works whether a checklist has 5 sections or 20."""
     last_row = min(ws.max_row, STRUCTURE_SCAN_LIMIT)
-    rows = []
+
+    def blank_ab(r):
+        return _norm(ws.cell(row=r, column=1).value) == "" and _norm(ws.cell(row=r, column=2).value) == ""
+
+    def numbered(r):
+        return bool(_ITEM_NUMBER_RE.match(_norm(ws.cell(row=r, column=1).value)))
+
+    def has_response(r):
+        return any(_norm(ws.cell(row=r, column=c).value) != ""
+                   for c in range(PATIENT_START_COL, score_col))
+
+    # runs of consecutive non-blank rows
+    runs, start = [], None
+    for r in range(header_row + 1, last_row + 2):
+        if r <= last_row and not blank_ab(r):
+            if start is None:
+                start = r
+        elif start is not None:
+            runs.append((start, r - 1))
+            start = None
+
+    rows = set()
+    seen_section = False
+    for first, last in runs:
+        if not any(numbered(r) for r in range(first, last + 1)):
+            continue  # not a section (metadata rows, legend, signature, ...)
+        first_item = next(r for r in range(first, last + 1) if numbered(r))
+        # Step up over any sub-heading lines (column A empty, a description in column B)
+        # sitting between the heading and the first item.
+        r = first_item - 1
+        while r >= first and _norm(ws.cell(row=r, column=1).value) == "":
+            r -= 1
+        if r >= first:
+            # a text row inside the run directly above the (sub-heading and) first item
+            if has_response(r):
+                return [], (f"the checklist section whose first item is on row {first_item} has "
+                            f"no heading row above it (row {r} holds patient answers)")
+            rows.add(r)  # heading row, whatever it says
+        else:
+            above = first - 1  # the run opens with the items: heading cell was left blank
+            before_above_ok = (
+                above - 1 < header_row + 1          # just under the patient header rows
+                or blank_ab(above - 1)              # two blank rows: [average row][blank heading]
+                or not seen_section                  # first section: only metadata rows above
+            )
+            if above > header_row and blank_ab(above) and before_above_ok:
+                rows.add(above)
+            else:
+                return [], (f"the checklist section whose first item is on row {first_item} has "
+                            f"no heading row above it (expected a heading - or a blank row - "
+                            f"between the previous section's average row and its items)")
+        seen_section = True
+
+    # traditional 'X. NAME' headings (also inside runs), accepted in addition
     for r in range(header_row + 1, last_row + 1):
         v = ws.cell(row=r, column=1).value
         if isinstance(v, str) and _SECTION_HEADER_RE.match(v.strip()):
-            rows.append(r)
-    return rows
+            rows.add(r)
+    return sorted(rows), None
 
 
 def _is_data_row(ws, row: int, avg_rows: set) -> bool:
@@ -1213,7 +1300,7 @@ def consolidate(ordered_paths_and_names: list, output_path: str, analyses: list 
                 # anchor value propagated to every covered cell, before its data was
                 # captured - same fix the base sheet gets just above - so every value
                 # captured is a real, independently-readable one.)
-                warnings += compare_extract_text(ws, ex, header_row, max(avg_rows))
+                warnings += compare_extract_text(ws, ex, header_row, max(avg_rows), section_headers)
                 if ex["merge_other"]:
                     warnings.append(
                         f"{ex['merge_other']} unexpected merged cell(s) found in the "
