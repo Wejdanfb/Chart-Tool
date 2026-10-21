@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MCH Monthly Report</title>
+<title>Chart Review Report</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,15 +11,18 @@
 <div class="page">
 
   <header class="masthead">
-    <!-- Logo: /static/logo.png. If the image is missing or fails to load, the onerror handler
-         adds .logo-failed and the original "MCH" mark is shown instead. -->
+    <!-- Logo: static/logo.png, the supplied image used as-is. Its artwork sits in the middle of
+         a large transparent canvas, so the frame below shows just that area (uniform scale, no
+         stretching). If the file fails to load, the onerror handler hides the logo and the
+         title simply stands alone. -->
     <a class="masthead-logo" href="/" id="logo-link" tabindex="-1" aria-hidden="true">
-      <img src="/static/logo.png" alt="" class="masthead-logo-img"
-           onerror="this.parentNode.classList.add('logo-failed')">
-      <span class="masthead-mark">MCH</span>
+      <span class="logo-frame">
+        <img src="/static/logo.png" alt="" class="masthead-logo-img"
+             onerror="this.closest('.masthead-logo').classList.add('logo-failed')">
+      </span>
     </a>
     <div class="masthead-text">
-      <h1><a class="home-link" id="home-link" href="/" title="Back to the start screen">MCH Monthly Report</a></h1>
+      <h1><a class="home-link" id="home-link" href="/" title="Back to the start screen">Chart Review Report</a></h1>
       <p>Chart Review collecting tool</p>
     </div>
   </header>

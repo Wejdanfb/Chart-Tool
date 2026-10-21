@@ -1,5 +1,5 @@
 @echo off
-REM Double-click to start the MCH Monthly Consolidation Tool on Windows.
+REM Double-click to start the Chart Review Report tool on Windows.
 REM First run installs the required packages; later runs just start the tool.
 cd /d "%~dp0"
 

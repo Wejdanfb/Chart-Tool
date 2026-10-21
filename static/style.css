@@ -1,5 +1,5 @@
 /* ============================================================
-   MCH Monthly Report — visual identity
+   Chart Review Report — visual identity
 
    Grounded in the source material itself: the checklist's own
    banner uses a deep teal mark on a warm cream/gold field. That
@@ -68,39 +68,35 @@ html, body {
   margin-bottom: 36px;
 }
 
-/* Logo slot: the supplied image (aspect ratio preserved) with the original "MCH" mark as
-   a fallback if the image can't be loaded. */
+/* Logo: static/logo.png, shown as supplied. The artwork occupies only the middle of a
+   1080x1350 transparent canvas, so the frame crops to that area (plus a small margin) by
+   scaling the whole image uniformly and offsetting it - aspect ratio is never changed.
+   --logo is the displayed width of the artwork area. If the image can't load, the
+   .logo-failed class (set by the <img> onerror) hides the logo entirely. */
 .masthead-logo {
+  --logo: 60px;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   text-decoration: none;
 }
-.masthead-logo-img {
+.logo-frame {
+  position: relative;
   display: block;
-  height: 56px;
-  width: auto;
-  max-width: 180px;
-  object-fit: contain;
+  width: var(--logo);
+  height: calc(var(--logo) * 0.9938);
+  overflow: hidden;
 }
-.masthead-logo .masthead-mark { display: none; }
-.masthead-logo.logo-failed .masthead-logo-img { display: none; }
-.masthead-logo.logo-failed .masthead-mark { display: flex; }
-
-.masthead-mark {
-  flex: 0 0 auto;
-  width: 52px;
-  height: 52px;
-  border-radius: var(--radius-sm);
-  background: var(--teal-700);
-  color: var(--gold-100);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 13px;
-  letter-spacing: 0.04em;
+.masthead-logo-img {
+  position: absolute;
+  display: block;
+  width: calc(var(--logo) * 2.236);
+  height: auto;
+  left: calc(var(--logo) * -0.5839);
+  top: calc(var(--logo) * -0.9213);
+  max-width: none;
 }
+.masthead-logo.logo-failed { display: none; }
 
 .masthead-text h1 {
   margin: 0;

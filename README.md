@@ -1,4 +1,4 @@
-# MCH Monthly Report — Chart Review collecting tool
+# Chart Review Report — Chart Review collecting tool
 
 Consolidates each month's unit-level Nursing Chart Review Checklist files
 (Madinah Health Cluster) into one formatted `.xlsx` report, with a live
@@ -213,8 +213,8 @@ the tool. Worth checking that window if a report ever looks off.
   where to look if a future month's template changes and something
   needs adjusting.
 - `templates/`, `static/` — the browser UI. The header logo is `static/logo.png`
-  (replace that file to change it; if it is missing the original "MCH" mark is
-  shown instead). Clicking the **MCH Monthly Report** title returns to the start
+  (replace that file to change it; if it is missing or fails to load, the header
+  simply shows the title without a logo). Clicking the **Chart Review Report** title returns to the start
   screen; if files or a report are on screen it asks before clearing anything.
 - `uploads/`, `outputs/` — working folders, created automatically.
 
