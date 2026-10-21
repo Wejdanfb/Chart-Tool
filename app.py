@@ -223,7 +223,9 @@ def upload():
         saved_path = batch_dir / saved_name
         f.save(str(saved_path))
 
-        info = analyze_file(str(saved_path), original_name)
+        # extract=True also saves the file's patient-column data next to it, so generating the
+        # report later never has to parse this workbook a second time (the memory/CPU hot spot).
+        info = analyze_file(str(saved_path), original_name, extract=True)
         record = {
             "file_id": file_id,
             "filename": original_name,
@@ -309,8 +311,13 @@ def generate():
     internal_name = f"CHART_MCH_Consolidated_{batch_id[:8]}.xlsx"
     output_path = OUTPUT_DIR / internal_name
 
+    # Reuse the findings produced when each file was uploaded (same function, same file) so
+    # nothing is parsed twice; records from an older version without them just re-analyze.
+    stored = [r.get("analysis") for r in records]
+    analyses = [FileAnalysis.from_dict(a) for a in stored] if all(stored) else None
+
     try:
-        report = consolidate(ordered, str(output_path))
+        report = consolidate(ordered, str(output_path), analyses=analyses)
     except ValidationError as e:
         logger.warning("Generation blocked for batch %s: %s", batch_id, e)
         return jsonify({"error": str(e)}), 400

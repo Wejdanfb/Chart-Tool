@@ -92,7 +92,10 @@ real final example (never hand-designed), per the rules below:
 
 import copy
 import datetime
+import gc
 import hashlib
+import os
+import pickle
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Optional
@@ -218,10 +221,12 @@ def _unit_row(ws, header_row, first_header_row):
     return header_row + 3
 
 
-def _analyze_sheet(ws):
+def _analyze_sheet(ws, extract_out=None):
     """Decide from CONTENT whether `ws` is a Nursing Chart Review Checklist. Returns
     (SheetAnalysis, None) if it is, or (None, reason) if not - blank sheets, cover pages,
-    summary sheets and anything else land in the second case."""
+    summary sheets and anything else land in the second case. If `extract_out` is a dict,
+    the sheet's patient-column data is also captured into it (see _extract_sheet) while the
+    sheet is already loaded, so generating the report never has to re-open this workbook."""
     if ws.max_row < 5 or ws.max_column < PATIENT_START_COL:
         return None, "too small to be a checklist"
 
@@ -237,7 +242,7 @@ def _analyze_sheet(ws):
     # Dissolve merges in the patient/Score region IN MEMORY ONLY (nothing here is saved) so
     # every cell read below - including patients whose cells were visually merged - holds
     # its real value. See _sweep_merges_in_region.
-    _sweep_merges_in_region(ws, PATIENT_START_COL, score_col)
+    _, _, merge_other_count = _sweep_merges_in_region(ws, PATIENT_START_COL, score_col)
 
     section_headers = _find_section_headers(ws, header_row)
     if not section_headers:
@@ -324,6 +329,11 @@ def _analyze_sheet(ws):
         resp = [_norm_value(ws.cell(row=r, column=col).value) for r in item_rows]
         column_keys.append(hashlib.sha1(repr((meta, resp)).encode("utf-8")).hexdigest())
 
+    if extract_out is not None:
+        extract_out[ws.title] = _extract_sheet(
+            ws, header_row, kept_offsets, max(avg_rows), merge_other_count
+        )
+
     return SheetAnalysis(
         name=ws.title, header_row=header_row, score_col=score_col,
         section_headers=section_headers, section_header_text=section_header_text,
@@ -333,27 +343,37 @@ def _analyze_sheet(ws):
     ), None
 
 
-def analyze_file(path: str, filename: str) -> FileAnalysis:
-    """Inspect EVERY worksheet of an uploaded workbook and recognize the checklist
-    worksheet(s) by their content (section headers, numbered items, patient columns and a
-    Score column) - never by sheet name, sheet position, filename, or the presence of a
-    SUMMSRY sheet. A workbook may hold one checklist sheet or several (e.g. one per
-    department); unrelated, blank and summary/cover sheets are simply not processed."""
+def _analyze_workbook(path: str, filename: str, want_extract: bool):
+    """Open the workbook ONCE, recognize its checklist worksheet(s), and (optionally)
+    capture each one's patient-column data. Returns (FileAnalysis, extracts-or-None). The
+    workbook is closed and released before returning, so at most one source workbook is
+    ever held in memory at a time."""
     try:
         wb = openpyxl.load_workbook(path, data_only=False)
     except Exception as e:
-        return FileAnalysis(path, filename, valid=False, error=f"Could not open file: {e}")
+        return FileAnalysis(path, filename, valid=False, error=f"Could not open file: {e}"), None
 
-    sheets, skipped = [], []
-    for ws in wb.worksheets:
+    extracts = {} if want_extract else None
+    try:
+        sheets, skipped = [], []
+        for ws in wb.worksheets:
+            try:
+                sa, reason = _analyze_sheet(ws, extracts)
+            except Exception as e:  # one odd sheet must never take the whole workbook down
+                sa, reason = None, f"could not be read ({e})"
+            if sa is None:
+                skipped.append((ws.title, reason))
+                if extracts is not None:
+                    extracts.pop(ws.title, None)
+            else:
+                sheets.append(sa)
+    finally:
         try:
-            sa, reason = _analyze_sheet(ws)
-        except Exception as e:  # one odd sheet must never take the whole workbook down
-            sa, reason = None, f"could not be read ({e})"
-        if sa is None:
-            skipped.append((ws.title, reason))
-        else:
-            sheets.append(sa)
+            wb.close()
+        except Exception:
+            pass
+        del wb
+        gc.collect()  # openpyxl workbooks are reference cycles - free them now, not "eventually"
 
     if not sheets:
         detail = "; ".join(f"'{n}': {r}" for n, r in skipped) or "the workbook has no worksheets"
@@ -361,7 +381,7 @@ def analyze_file(path: str, filename: str) -> FileAnalysis:
             path, filename, valid=False, skipped_sheets=skipped,
             error=f"No Nursing Chart Review Checklist worksheet was found in this "
                   f"workbook. Every worksheet was checked by its content - {detail}.",
-        )
+        ), None
 
     # File-level summary, with each sheet's own notes prefixed by its name when the
     # workbook holds more than one checklist sheet.
@@ -376,7 +396,48 @@ def analyze_file(path: str, filename: str) -> FileAnalysis:
         unit_name=" + ".join(units) if units else None,
         patient_count=sum(sa.patient_count for sa in sheets),
         sheets=sheets, skipped_sheets=skipped,
-    )
+    ), extracts
+
+
+def _extract_path(path: str) -> str:
+    return path + ".extract"
+
+
+def analyze_file(path: str, filename: str, extract: bool = False) -> FileAnalysis:
+    """Inspect EVERY worksheet of an uploaded workbook and recognize the checklist
+    worksheet(s) by their content (section headers, numbered items, patient columns and a
+    Score column) - never by sheet name, sheet position, filename, or the presence of a
+    SUMMSRY sheet. A workbook may hold one checklist sheet or several (e.g. one per
+    department); unrelated, blank and summary/cover sheets are simply not processed.
+
+    With extract=True (what the web app uses at upload time) the recognized sheets'
+    patient-column data is saved next to the file (`<path>.extract`), so that generating
+    the report later does not have to parse this workbook a second time - parsing is by far
+    the most expensive (CPU and memory) step on a small server."""
+    info, extracts = _analyze_workbook(path, filename, extract)
+    if extract and info.valid and extracts:
+        tmp = _extract_path(path) + f".{os.getpid()}.tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump(extracts, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, _extract_path(path))
+    return info
+
+
+def _load_extracts(info: "FileAnalysis") -> dict:
+    """Patient-column data for every recognized sheet of `info`'s file: read from the file
+    saved at upload time if present, otherwise (e.g. consolidate() called directly) captured
+    now by opening the workbook once - exactly the same code path either way."""
+    try:
+        with open(_extract_path(info.path), "rb") as fh:
+            data = pickle.load(fh)
+        if all(sa.name in data for sa in info.sheets):
+            return data
+    except Exception:
+        pass
+    _, extracts = _analyze_workbook(info.path, info.filename, True)
+    if not extracts or not all(sa.name in extracts for sa in info.sheets):
+        raise ValidationError(f"{info.filename}: could not re-read the file's checklist data.")
+    return extracts
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +562,88 @@ def plan_batch(analyses: list) -> list:
     return plans
 
 
+def _extract_sheet(ws, header_row, kept_offsets, last_avg_row, merge_other_count):
+    """Capture, from an already-loaded and merge-swept sheet, everything consolidate() needs
+    from it: each kept patient column's cell values and cell styles (rows 1..the copy
+    extent, exactly what _copy_patient_column would read), its explicit column width, the
+    A/B checklist wording (for the non-blocking wording comparison), and how many unexpected
+    merges had to be dissolved. A few KB per sheet - the heavy openpyxl workbook is not
+    needed again. Identical styles are stored once and referenced by number."""
+    last_row = last_avg_row + TRAILING_ROW_PADDING
+    styles, style_ids, columns = [], {}, {}
+    for offset in kept_offsets:
+        col = PATIENT_START_COL + offset
+        cells = []
+        for r in range(1, last_row + 1):
+            cell = ws.cell(row=r, column=col)
+            sid = None
+            if cell.has_style:
+                key = tuple(cell._style)
+                sid = style_ids.get(key)
+                if sid is None:
+                    sid = style_ids[key] = len(styles)
+                    styles.append((
+                        copy.copy(cell.font), copy.copy(cell.border), copy.copy(cell.fill),
+                        copy.copy(cell.alignment), cell.number_format, copy.copy(cell.protection),
+                    ))
+            cells.append((cell.value, sid))
+        dim = ws.column_dimensions.get(get_column_letter(col))
+        columns[offset] = {"cells": cells, "width": dim.width if (dim and dim.width) else None}
+    text = {r: (_norm(ws.cell(row=r, column=1).value), _norm(ws.cell(row=r, column=2).value))
+            for r in range(header_row, last_avg_row + 1)}
+    return {"styles": styles, "columns": columns, "text": text, "merge_other": merge_other_count}
+
+
+def _apply_extracted_column(extract, offset, dst_ws, dst_col, last_row, style_cache):
+    """Write one captured patient column into the consolidated sheet - the same result as
+    _copy_patient_column reading from the live source sheet. The first time a given captured
+    style is applied it is registered in the output workbook the normal way; the resulting
+    internal style record is then reused for every other cell with that style (a patient
+    column has only a handful of distinct styles, repeated hundreds of times), which avoids
+    re-hashing/re-copying full style objects per cell - the other big CPU cost after parsing."""
+    col = extract["columns"][offset]
+    styles = extract["styles"]
+    for r, (value, sid) in enumerate(col["cells"], start=1):
+        if r > last_row:
+            break
+        dst_cell = _ensure_writable(dst_ws, r, dst_col)
+        dst_cell.value = value
+        if sid is None:
+            continue
+        cache_key = (id(extract), sid)
+        cached = style_cache.get(cache_key)
+        if cached is not None:
+            dst_cell._style = copy.copy(cached)
+            continue
+        font, border, fill, alignment, number_format, protection = styles[sid]
+        dst_cell.font = copy.copy(font)
+        dst_cell.border = copy.copy(border)
+        dst_cell.fill = copy.copy(fill)
+        dst_cell.alignment = copy.copy(alignment)
+        dst_cell.number_format = number_format
+        dst_cell.protection = copy.copy(protection)
+        style_cache[cache_key] = copy.copy(dst_cell._style)
+
+
+def compare_extract_text(master_ws, extract, first_row, last_row) -> list:
+    """Same check as compare_to_master_text, against the A/B wording captured when the
+    other sheet was read."""
+    diffs = []
+    for r in range(first_row, last_row + 1):
+        a_m, b_m = _norm(master_ws.cell(row=r, column=1).value), _norm(master_ws.cell(row=r, column=2).value)
+        a_o, b_o = extract["text"].get(r, ("", ""))
+        if a_m != a_o or b_m != b_o:
+            diffs.append(r)
+    if diffs:
+        return [
+            f"Checklist text differs from the master sheet at row(s) "
+            f"{', '.join(str(r) for r in diffs[:6])}"
+            + (f" and {len(diffs) - 6} more" if len(diffs) > 6 else "")
+            + ". Only the master sheet's wording is used in the output."
+        ]
+    return []
+
+
 def compare_to_master_text(master_ws, other_ws, first_row, last_row) -> list:
     """Light consistency check: flag if a sheet's own A/B checklist wording differs from
     the master sheet's. Non-blocking - just a warning (typo fixes etc. are common), since
@@ -542,11 +685,18 @@ def _copy_patient_column(src_ws, src_col, dst_ws, dst_col, last_row):
     which is never "copied"). Every destination cell is passed through _ensure_writable
     first: the upfront region sweep should already have cleared every merge here, but
     this is a cheap per-cell safety net against any merge the sweep didn't anticipate."""
+    same_workbook = src_ws.parent is dst_ws.parent
     for r in range(1, last_row + 1):
         src_cell = src_ws.cell(row=r, column=src_col)
         dst_cell = _ensure_writable(dst_ws, r, dst_col)
         dst_cell.value = src_cell.value
-        _copy_cell_style(src_cell, dst_cell)
+        if same_workbook:
+            # Same workbook = same style tables, so the internal style record can be copied
+            # as-is (identical result to copying font/border/fill/... one by one, far cheaper).
+            if src_cell.has_style:
+                dst_cell._style = copy.copy(src_cell._style)
+        else:
+            _copy_cell_style(src_cell, dst_cell)
 
 
 def _set_column_width(src_ws, src_col, dst_ws, dst_col, fallback_width):
@@ -951,19 +1101,26 @@ def _rename_checklist_sheet(wb, ws, new_name):
     return old, new_name
 
 
-def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
+def consolidate(ordered_paths_and_names: list, output_path: str, analyses: list = None) -> dict:
     """
     ordered_paths_and_names: list of (filepath, original_filename) tuples, in the exact
     order patient columns should appear (upload order).
     Every recognized checklist worksheet of every file contributes its patient columns.
+    analyses: optional FileAnalysis list, aligned with ordered_paths_and_names - the findings
+    already produced when each file was uploaded. Passing them avoids parsing every workbook
+    a second time here; omitted, each file is analyzed now (same function either way).
+
+    Memory/CPU design: only the FIRST file's workbook (the output's master) is ever held
+    open. Every other source contributes from the compact patient-column extract captured
+    when it was analyzed (see _extract_sheet), so no second workbook is loaded alongside it.
     Returns a dict report of what was done (for display / audit).
     """
     if not ordered_paths_and_names:
         raise ValidationError("No files provided.")
 
     infos = []
-    for path, name in ordered_paths_and_names:
-        info = analyze_file(path, name)
+    for i, (path, name) in enumerate(ordered_paths_and_names):
+        info = analyses[i] if analyses else analyze_file(path, name)
         if not info.valid:
             raise ValidationError(f"{name}: {info.error}")
         infos.append(info)
@@ -1038,35 +1195,28 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
     report_files = []
     current_col = PATIENT_START_COL
     running_index = 0
-    loaded = {}  # path -> workbook, for files other than the base (read-only use)
+    style_cache = {}  # (extract, style number) -> output-workbook style record; see _apply_extracted_column
     for fi, (info, plan) in enumerate(zip(infos, plans)):
+        extracts = None  # this file's captured patient-column data, loaded only if needed
         warnings = list(info.warnings) + list(plan.notes)
         start_col = current_col
         for sp in plan.sheets:
             sa = sp.sheet
-            if fi == 0 and sa is base_sa:
+            is_base_sheet = fi == 0 and sa is base_sa
+            if is_base_sheet:
                 src_ws = ws  # base sheet: data's already in place, nothing to copy
             else:
-                if fi == 0:
-                    src_wb = wb  # another checklist sheet of the base workbook
-                else:
-                    if info.path not in loaded:
-                        loaded[info.path] = openpyxl.load_workbook(info.path, data_only=False)
-                    src_wb = loaded[info.path]
-                src_ws = src_wb[sa.name]
-                # This sheet is only ever READ from below, never saved - but if IT has its
-                # own unusual merge in the patient-column area (e.g. a Unit/Ward label
-                # merged across a few of its patient columns), reading a non-anchor merged
-                # cell's .value returns None, silently losing that patient's data on copy.
-                # Same fix as the base sheet gets: dissolve any such merge and propagate
-                # the anchor's value first, so every cell we copy from is a real value.
-                _, _, src_other_merge_count = _sweep_merges_in_region(
-                    src_ws, PATIENT_START_COL, sa.score_col
-                )
-                warnings += compare_to_master_text(ws, src_ws, header_row, max(avg_rows))
-                if src_other_merge_count:
+                if extracts is None:
+                    extracts = _load_extracts(info)
+                ex = extracts[sa.name]
+                # (This sheet's merges in the patient-column area were already dissolved,
+                # anchor value propagated to every covered cell, before its data was
+                # captured - same fix the base sheet gets just above - so every value
+                # captured is a real, independently-readable one.)
+                warnings += compare_extract_text(ws, ex, header_row, max(avg_rows))
+                if ex["merge_other"]:
                     warnings.append(
-                        f"{src_other_merge_count} unexpected merged cell(s) found in the "
+                        f"{ex['merge_other']} unexpected merged cell(s) found in the "
                         f"patient columns of '{sa.name}' - resolved (value copied to every "
                         f"cell the merge covered) before reading its patient data."
                     )
@@ -1075,13 +1225,19 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
                 src_col = PATIENT_START_COL + offset
                 dst_col = current_col
                 running_index += 1
-                if not (src_ws is ws and dst_col == src_col):
-                    _copy_patient_column(src_ws, src_col, ws, dst_col, copy_last_row)
-                _set_column_width(src_ws, src_col, ws, dst_col, fallback_patient_width)
+                if is_base_sheet:
+                    if dst_col != src_col:
+                        _copy_patient_column(src_ws, src_col, ws, dst_col, copy_last_row)
+                    _set_column_width(src_ws, src_col, ws, dst_col, fallback_patient_width)
+                else:
+                    _apply_extracted_column(ex, offset, ws, dst_col, copy_last_row, style_cache)
+                    width = ex["columns"][offset]["width"] or fallback_patient_width
+                    if width:
+                        ws.column_dimensions[get_column_letter(dst_col)].width = width
                 _ensure_writable(ws, header_row, dst_col)
                 ws.cell(row=header_row, column=dst_col).value = running_index
                 current_col += 1
-        loaded.pop(info.path, None)
+        extracts = None
 
         got = current_col - start_col
         report_files.append({
@@ -1242,7 +1398,11 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
     for sheet in wb.worksheets:
         sheet.sheet_view.tabSelected = sheet is ws
 
+    checklist_title = ws.title
     wb.save(output_path)
+    wb.close()
+    del wb, ws
+    gc.collect()  # release the output workbook now rather than whenever the GC next runs
 
     if other_merge_count:
         report_files[0]["warnings"] = report_files[0]["warnings"] + [
@@ -1269,7 +1429,7 @@ def consolidate(ordered_paths_and_names: list, output_path: str) -> dict:
         "total_patients": total_patients,
         "score_column": final_score_letter,
         "files": report_files,
-        "checklist_sheet": ws.title,
+        "checklist_sheet": checklist_title,
         "section_average_rows": avg_rows,
         "blank_item_rows": blank_item_rows,
         "formula_item_rows_count": len(formula_item_rows),
